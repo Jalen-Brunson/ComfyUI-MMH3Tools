@@ -3,6 +3,10 @@
 MiniMax H3 latent tooling for ComfyUI — latent-domain conditioning and correct AV
 splicing for **chained long-form generation**.
 
+Experimental [hybrid sampling and accepted-prefix resume](docs/hybrid-sampling.md)
+combine sequential motion setup with a joint finish across overlapping windows.
+Completed master/video pairs can be selected automatically for continuation.
+
 ## What has actually been run
 
 **`carry="mask"` is the tested path.** Every example workflow ships with it, and every

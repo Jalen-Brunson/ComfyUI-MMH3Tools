@@ -16,6 +16,9 @@ from .nodes_lint import MMH3PromptLint
 from .nodes_music import (MMH3LyricsSectionize, MMH3MusicCaptionSplit,
                           MMH3MusicCaptionSystemPrompt)
 from .nodes_looping_sampler import MMH3KeyframePlanner, MMH3LoopingSampler
+from .nodes_joint_sampler import MMH3JointWindowSampler
+from .nodes_hybrid_sampler import MMH3HybridWindowSampler
+from .nodes_resume import MMH3LoadResumeRun, MMH3SaveResumeVideo
 from .nodes_save import MMH3SizeCappedCopy, MMH3StreamingSave
 from .nodes_upscale import MMH3ChunkedPixelUpscale
 from .nodes_tokens import MMH3OfficialTokens
@@ -77,6 +80,10 @@ NODES = [
     MMH3FrameCalculator,
     # MMH3Tools/sampling
     MMH3LoopingSampler,
+    MMH3JointWindowSampler,
+    MMH3HybridWindowSampler,
+    MMH3LoadResumeRun,
+    MMH3SaveResumeVideo,
     MMH3ContextWindows,
     # MMH3Tools/calculators
     MMH3ChunkSchedule,
