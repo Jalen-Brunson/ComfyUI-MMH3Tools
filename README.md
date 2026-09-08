@@ -7,6 +7,9 @@ Experimental [hybrid sampling and accepted-prefix resume](docs/hybrid-sampling.m
 combine sequential motion setup with a joint finish across overlapping windows.
 Completed master/video pairs can be selected automatically for continuation.
 
+[Apply H3 RefMods to Cond Set](docs/refmods.md) injects a MiniMaxH3Mod bundle into
+every chunk's conditioning while keeping trailing control references in place.
+
 ## What has actually been run
 
 **`carry="mask"` is the tested path.** Every example workflow ships with it, and every

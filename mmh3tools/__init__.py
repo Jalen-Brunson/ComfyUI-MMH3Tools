@@ -19,6 +19,7 @@ from .nodes_looping_sampler import MMH3KeyframePlanner, MMH3LoopingSampler
 from .nodes_joint_sampler import MMH3JointWindowSampler
 from .nodes_hybrid_sampler import MMH3HybridWindowSampler
 from .nodes_resume import MMH3LoadResumeRun, MMH3SaveResumeVideo
+from .nodes_refmods import H3RefModCondSetApply
 from .nodes_save import MMH3SizeCappedCopy, MMH3StreamingSave
 from .nodes_upscale import MMH3ChunkedPixelUpscale
 from .nodes_tokens import MMH3OfficialTokens
@@ -117,6 +118,7 @@ NODES = [
     MMH3MusicCaptionSplit,
     MMH3LyricsSectionize,
     # MMH3Tools/conditioning
+    H3RefModCondSetApply,
     MMH3ReferenceMultiPrompt,
     MMH3Regenerate2KReference,
     MMH3CondSelect,
