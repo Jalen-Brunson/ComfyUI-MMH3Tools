@@ -32,7 +32,42 @@ nodes require matching window/overlap settings and one conditioning set per
 window. Connect the model before other Context Windows nodes. H3-aligned frame
 counts and window starts are required; keyframe guides are not supported here.
 
-## Continuing an accepted prefix
+## Resumable V2V Character Replacement
+
+This workflow replaces a masked character in an existing video while retaining
+the source video's timing, motion, camera path, and unmasked content. It is built
+for long replacements that need to be generated and reviewed a few overlapping
+windows at a time. Accepted-prefix resume lets an artist approve the beginning of
+the replacement, keep it, and extend the result without generating those accepted
+chunks again.
+
+The end-to-end flow is:
+
+1. Load the source video, the character replacement mask, character references,
+   and prompts. The mask determines which source regions may be regenerated and
+   which remain fixed.
+2. For a fresh run, choose how many windows to generate. The hybrid sampler starts
+   each window sequentially to establish motion, then jointly finishes the
+   overlapping windows so neighboring predictions can inform their shared frames.
+3. Review the rendered result and choose how many complete opening chunks to
+   accept. The save step records the full latent master together with its matching
+   rendered video.
+4. To continue, choose the number of accepted chunks and the number of new chunks
+   to add. The workflow loads the latest completed master/video pair for the same
+   project and prompt variant. An older registered pair can be selected explicitly.
+5. The last accepted window is supplied as pinned context while the sampler
+   generates the next source-aligned windows. Earlier accepted windows do not run
+   through the sampler again.
+6. The workflow restores the accepted latent prefix exactly, merges the newly
+   generated latents into a new full master, keeps the accepted rendered frames,
+   appends only the newly decoded frames, and registers the new master/video pair
+   for a later continuation.
+
+This is a resume between completed generations, not recovery of an interrupted
+denoising step. The chunk grid, overlap, resolution, frame rate, and source
+timeline must remain unchanged between runs.
+
+### Resume controls and saved pairs
 
 The hybrid sampler's optional `accepted_prefix_frames` fixes the beginning of
 its input, including audio, through both phases. Fully accepted windows skip
@@ -53,14 +88,11 @@ zero and describe the same frame count as the video. Missing files and
 unregistered pairs are not selected automatically. Pre-existing outputs need an
 explicit pair record; matching filenames alone are not sufficient.
 
-The existing 05 workflow supplies timeline slicing and assembly through
-`H3ContinueMaster`, `H3MergeMasters`, and `H3SaveAVLatent` from its separate workflow
-helpers. The sampler and pair-selection nodes do not replace those helpers.
-On continuation, that workflow supplies the last accepted window as pinned
-context, merges the new latent into the full master, and appends only new decoded
-frames to the accepted video. Chunk grid, overlap, resolution, FPS, and source
-timeline must match. The saved latent prefix is exact; normal MP4 re-encoding
-does not preserve the original compressed bytes or decoded pixels bit for bit.
+**Resumable V2V Character Replacement** supplies timeline slicing and assembly
+through `H3ContinueMaster`, `H3MergeMasters`, and `H3SaveAVLatent` from its separate
+workflow helpers. The sampler and pair-selection nodes do not replace those
+helpers. The saved latent prefix is exact; normal MP4 re-encoding does not
+preserve the original compressed bytes or decoded pixels bit for bit.
 
 ## Validation
 

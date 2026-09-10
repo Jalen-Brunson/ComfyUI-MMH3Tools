@@ -3,9 +3,14 @@
 MiniMax H3 latent tooling for ComfyUI — latent-domain conditioning and correct AV
 splicing for **chained long-form generation**.
 
-Experimental [hybrid sampling and accepted-prefix resume](docs/hybrid-sampling.md)
-combine sequential motion setup with a joint finish across overlapping windows.
-Completed master/video pairs can be selected automatically for continuation.
+The experimental **Resumable V2V Character Replacement** workflow uses
+[hybrid sampling and accepted-prefix resume](docs/hybrid-sampling.md) to replace
+a masked character across a long source video. The source supplies the original
+timing, motion, camera, and surrounding scene; overlapping windows regenerate the
+character region. After reviewing a partial result, you can keep the accepted
+opening chunks and generate only the next section. The workflow automatically
+reloads the matching latent master and rendered video, uses the last accepted
+window as continuation context, and saves a new complete pair for the next run.
 
 [Apply H3 RefMods to Cond Set](docs/refmods.md) injects a MiniMaxH3Mod bundle into
 every chunk's conditioning while keeping trailing control references in place.
