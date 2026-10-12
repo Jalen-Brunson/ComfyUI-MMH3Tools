@@ -364,6 +364,17 @@ Outpaint Latent**, and **MMH3 Reframe Pads** solves the pad geometry for a 9:16 
 **MMH3 Context Windows** carries one sampler pass across the whole clip instead of
 chunking it through the looping sampler.
 
+## Companion packs
+
+**[ComfyUI-HybridWindows](https://github.com/Jalen-Brunson/ComfyUI-HybridWindows)** by
+Jalen Brunson started life as a fork of this pack and grew into its own: a Rolling
+Diffusion take on long H3 generation, with a sequential warm-up per window and then a
+joint finish. People running it report long renders holding up better over many loops,
+with less of the overcooked skin and colour drift that builds up chunk after chunk. It
+also brings keyframes, resume-from-chunk, V2V workflows and latent-upscale flows. It
+builds on this pack's window and conditioning helpers, so install both. Well worth a
+look if your long runs start to cook.
+
 ## Nodes
 
 In the Add Node menu these are filed under `MMH3Tools/…`, following the same layout
