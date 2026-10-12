@@ -305,23 +305,19 @@ applied to core (a draft) and the union checkpoint in `models/controlnet/`. See
 `CannyEdgePreprocessor`, `DepthAnythingV2Preprocessor`, `HEDPreprocessor`,
 `M-LSDPreprocessor`, `OpenposePreprocessor`/`DWPreprocessor` — so raw video in is fine.
 
-**`SolAttnMiniMax` is Kijai's single-file Sol-Attn node**
-([arXiv 2607.24027](https://arxiv.org/abs/2607.24027)), which reaches H3's attention
-through comfy-kitchen's CUDA kernels — it wants `comfy_kitchen` built with `sol_attn`
-(bf16, head_dim 128, sm_80+) and otherwise falls back to the existing backend. Eleven
-of the twelve workflows carry it because it is a speed override, not pipeline logic.
+**Sampling defaults (0.104.1).** The generate pass in the examples runs without a turbo
+LoRA: `ModelAttentionBackend` on **comfy kitchen attention**, then `BasicScheduler` beta at
+**10 steps**, with the phase-1 `ClownSampler` at eta 0.2 handing over to `linear/euler`.
+The turbo LoRA loader is still in each graph, **bypassed**. Re-enable it and set the
+scheduler back to 8 steps for the few-step path the examples used before.
 
-The workflows here are on **v3**, the file linked at the bottom of
-[comfy-kitchen PR #117](https://github.com/Comfy-Org/comfy-kitchen/pull/117). It keeps
-the same `node_id` as v2 but the input list changed, so the two files cannot coexist
-and v2's widget values do not carry over positionally — Kijai's own instruction was to
-remake the node. `tau` now lives under a **`selection`** dynamic combo offering
-`adaptive tau` (tau + `tau_profile`) or `top-k (SLA)` (`keep_percent`, the selection
-lightx2v's SLA turbo LoRAs were distilled against). `routed_cap_percent` is gone.
-These graphs ship on `adaptive tau` at the same 1.3 they used before.
+Two examples keep the turbo LoRA on: **Regenerate-2K** and **Upscale**. Their 2K and
+refine passes run only a few steps and are built around it.
 
-**If you do not have it, delete the node** and wire `ModelAttentionBackend` straight
-through to the LoRA loader. Nothing else in the graph depends on it.
+**No example carries Kijai's `SolAttnMiniMax` (Sol-Attn) any more.** It was a speed
+override, not pipeline logic, and leaving it in made every graph report a missing node
+on installs without it. To use it, insert it between `ModelAttentionBackend` and the LoRA
+loader; nothing else in a graph depends on it.
 
 The prompt nodes are easy to swap for your own — see the Note on each canvas.
 

@@ -9,6 +9,38 @@ Never insert or reorder existing inputs, or saved workflows silently rebind to t
 wrong widgets. A node that has not shipped may still be reordered freely — say so in
 the entry, and migrate any local workflow in the same commit.
 
+## [Unreleased] — 0.104.1
+
+### Changed
+
+- **The example workflows move to the current sampling recipe.** Nine generate graphs
+  (Cinematic, Monologue, MusicVideo, Masking, I2V ManualPrompt, I2V PromptBuilding,
+  I2V ControlNet, RefVideo Chunked, Outpaint) now run the generate pass without the turbo
+  LoRA: `BasicScheduler` beta at **10 steps** (was 8), phase-1 `ClownSampler` eta **0.2**
+  where it was 0.4 (Cinematic, Monologue, MusicVideo), and `ModelAttentionBackend` on
+  **comfy kitchen attention** (Outpaint was on pytorch attention). The turbo LoRA loader
+  stays in each graph, **bypassed**, so the few-step path is one re-enable and a step
+  count away.
+
+  **Regenerate-2K and Upscale keep the turbo LoRA on.** Their 2K and refine passes run
+  only a few steps and are built around it.
+
+- **`SolAttnMiniMax` removed from all eleven examples that carried it.** It was a speed
+  override rather than pipeline logic, and a graph that names a node the user lacks
+  reports it missing on load, bypassed or not. The MODEL is spliced straight through
+  (`ModelAttentionBackend` into the LoRA loader; in Regenerate-2K, the LoRA loader into
+  the scheduler and guider), so nothing else in a graph moved. README updated to match.
+
+### Fixed
+
+- **`MMH3_Looping_Monologue.json`: two half-registered links repaired.** Links 604
+  (`MMH3ScenePlanPrompt.system_prompt` → `LlamaGenerate.system`) and 605
+  (`MMH3PromptAccumulate.prior_context` → `MMH3ScenePlanPrompt.prev_detailed`) were on
+  their targets and in the link table but missing from their origins' output lists. A run
+  still got them, since the prompt is built from the input side, but the editor did not
+  draw those wires and moving either node could drop them. Every example now passes a
+  link-integrity sweep: each link present on its origin, its target and in the table.
+
 ## [Unreleased] — 0.104.0
 
 ### Fixed
