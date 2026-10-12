@@ -9,6 +9,40 @@ Never insert or reorder existing inputs, or saved workflows silently rebind to t
 wrong widgets. A node that has not shipped may still be reordered freely — say so in
 the entry, and migrate any local workflow in the same commit.
 
+## [Unreleased] — 0.105.0
+
+### Added
+
+- **MiniMax H3 Looping Sampler: `guide_video`**, a source clip anchored as a GUIDE under
+  every chunk. Core's Add Guide for MiniMax H3 anchors a guide clip for one generation
+  and cannot follow a clip across chunks, and this node strips guides arriving on the
+  conditioning (one upstream guide would pin every chunk to the source's opening
+  frames). Now each chunk cuts its own span of the source, encodes it as one clip (cut
+  to 17k+5 frames, as core does) and anchors it at the chunk's frame 0, so every chunk
+  is guided by the frames it renders, on the output's clock.
+
+  Built for guide-latent LoRAs (edit and style-transfer LoRAs trained on guide/target
+  pairs), which do nothing through a reference. Spans are encoded fresh per chunk, so
+  each guide opens on a real 1-frame token. Shorter or longer sources are reported, not
+  fatal. Refuses `carry="keyframe"` and `keyframes` alongside it (two guides on the same
+  frames), and refuses without `vae` or #15439. With references present it relies on
+  guides anchoring at the target origin, which current core does (checked:
+  `_guide_origin_correct()` is True on v0.34.0-200).
+
+  Appended as the LAST input, so saved graphs keep their widget order. The hidden
+  `prior_av_latent` comment now says to restore that socket AFTER `guide_video`.
+  New `tests/test_guide_video.py` (26 checks, stubbed sampler); not yet run on a real
+  render.
+
+- **`workflows/MMH3_Looping_GuideVideo_StyleTransfer.json`**, the example for it: the
+  Masking graph with the SAM3 matte chain and the source encode removed (with no mask, a
+  full-denoise pass would overwrite the encoded source anyway), the sampler fed the
+  Reference node's latent so the source audio stays pinned, the source frames wired to
+  `guide_video`, ref2va + Alisson's `minimax_h3_style_transfer_v1.0_r64` at 1.0, a
+  `style_transfer:` prompt against a `<Picture 1>` style image, and 10 s windows. A Note
+  on the canvas explains guide versus reference and where the LoRA comes from. Link
+  integrity swept: 26 nodes, 41 links, nothing dangling.
+
 ## [Unreleased] — 0.104.1
 
 ### Changed

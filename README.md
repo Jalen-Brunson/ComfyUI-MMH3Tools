@@ -342,6 +342,22 @@ told anything about it. Nothing is wired into `audio_denoise_mask`: a subject ma
 white somewhere in every frame and carries no temporal intent, so it must not be
 allowed to reach the audio half. Wire a mask there only to freeze or free a **span**.
 
+[`workflows/MMH3_Looping_GuideVideo_StyleTransfer.json`](workflows/) — v2v style transfer
+over a clip of any length, through the sampler's **`guide_video`** (0.105.0). The
+source's frames go straight into `guide_video`, so each chunk is guided by its own span
+of them, on the output's clock; the source's sound rides through `use_input_audio` on
+the Reference node, as in the Masking graph this one is built from. The style image is
+`<Picture 1>`, and the prompt uses the LoRA's `style_transfer:` trigger.
+
+It needs a **guide-latent LoRA**. A full-clip guide does nothing useful on the base
+model, which is trained only for first/last-frame anchors. The graph ships pointing at
+Alisson's `minimax_h3_style_transfer_v1.0_r64.safetensors` on the **ref2va** base, from
+[Alissonerdx/Minimax-H3-ComfyUI](https://huggingface.co/Alissonerdx/Minimax-H3-ComfyUI)
+(strength 1.0; about 0.7 if the style starts changing the motion). Windows are 10 s,
+because a guide roughly doubles each chunk's sequence. `carry` stays `mask`. Built
+from the node's unit tests and Alisson's single-generation settings; it has not yet
+been run end to end here.
+
 [`workflows/MMH3_Outpaint.json`](workflows/) — reframing, not generation: a landscape
 clip is encoded with **MMH3 Streaming Encode**, extended in the latent by **MMH3
 Outpaint Latent**, and **MMH3 Reframe Pads** solves the pad geometry for a 9:16 target.
@@ -1026,6 +1042,32 @@ a choice here — now lives in
   for dual-solver setups. All three carry LTXAVTools' semantics unchanged. See
   [`docs/looping-sampler.md`](docs/looping-sampler.md) — including what is still
   unmeasured.
+
+  **`guide_video`** (0.105.0) is core's **Add Guide for MiniMax H3**, windowed. Core
+  anchors a guide clip for ONE generation; it cannot follow a clip across chunks, and
+  this node strips any guide arriving on the conditioning, because one upstream guide
+  would anchor every chunk to the source's opening frames. So the source comes in
+  here instead: each chunk takes its own span of it, encodes that span as one clip
+  (cut to 17k+5 frames, as core does) and anchors it at the chunk's frame 0. Every
+  chunk is guided by exactly the frames it renders, on the output's own clock.
+
+  That is what guide-latent LoRAs need: edit and style-transfer LoRAs trained on
+  guide/target pairs, which have no effect through a reference. A **reference** sits
+  on its own clock, so the model uses it as material and motion drifts; a **guide**
+  sits on the target's, so it lines up frame for frame. The base model is trained only
+  for first/last-frame anchors, so a full-clip guide does nothing useful without such
+  a LoRA.
+
+  Frames are centre-cropped to the generation's grid. A source shorter than the clip
+  guides what it covers and leaves the rest unguided; a longer one has its excess
+  ignored; both are reported. Each span is encoded **fresh** rather than sliced from
+  one whole-clip encode, so every guide opens on a real 1-frame token, as a
+  single-generation guide does. A guide roughly **doubles each chunk's sequence**:
+  chunks run slower and may need a smaller `chunk_frames`. Picture only; keep the
+  source's sound with `use_input_audio`. It refuses `carry="keyframe"` and
+  `keyframes`, which would stack a second guide on frames it already guides — use
+  `carry="mask"`. Unit-tested against a stubbed sampler
+  (`tests/test_guide_video.py`); not yet run on a real render.
 
 - **MiniMax H3 Keyframe Planner** — end-anchored keyframe indices for a chained run,
   ported from LTXAVTools' planner. Frame 0 opens, each chunk travels to a keyframe at
