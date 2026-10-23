@@ -182,7 +182,8 @@ def _chunk_guider(guider, positive, frame0=None):
 
 def _run_sampling(noise, guider, sampler, sigmas, av_init,
                   sampling_start_step, sampling_end_step,
-                  phase2_sampler=None, phase2_guider=None, phase2_start_step=0):
+                  phase2_sampler=None, phase2_guider=None, phase2_start_step=0,
+                  carry_noise=None):
     """Run one chunk's schedule as sequential resample-continuation segments.
 
     NOTHING HERE WINDOWS A GUIDE. A keyframe guide is not a per-step influence:
@@ -226,8 +227,21 @@ def _run_sampling(noise, guider, sampler, sigmas, av_init,
     phase2_local = int(phase2_start_step) - start
     end_step = int(sampling_end_step) - start
 
+    # LOCAL PATCH 2026-09-07 (carry_noise): the steps whose sigma >= until_sigma run as their
+    # own segment with the carried rows at a fractional mask (H3 derives per-row timesteps
+    # from the mask once per SamplerCustomAdvanced call, so a per-step mask change would
+    # mislabel the rows -- a separate segment keeps labels and noise consistent); afterwards
+    # the carried rows are restored byte-original and the remaining steps pin them exactly.
+    cn_cut = None
+    if carry_noise is not None and carry_noise[0] > 0.0 and carry_noise[2] > 0:
+        k = 0
+        while k < len(sigmas) and float(sigmas[k]) >= float(carry_noise[1]):
+            k += 1
+        if 0 < k < end_step:
+            cn_cut = k
     cut_points = sorted(
-        p for p in ({phase2_local} if use_phase2 else set()) if 0 < p < end_step)
+        p for p in (({phase2_local} if use_phase2 else set()) | ({cn_cut} if cn_cut else set()))
+        if 0 < p < end_step)
 
     segments = []
     remaining = sigmas
@@ -240,6 +254,12 @@ def _run_sampling(noise, guider, sampler, sigmas, av_init,
     segments.append((prev, tail))
 
     current = av_init
+    orig_mask = av_init.get("noise_mask")
+    orig_head = None
+    if cn_cut is not None:
+        level, _until, carried = carry_noise
+        ov, oa = unpack_av(av_init, "chunk input")
+        orig_head = ov[:, :, :carried].clone()
     for seg_start, seg_sigmas in segments:
         if len(seg_sigmas) <= 1:
             continue
@@ -247,8 +267,26 @@ def _run_sampling(noise, guider, sampler, sigmas, av_init,
         if use_phase2 and seg_start >= phase2_local:
             seg_sampler = phase2_sampler
             seg_guider = phase2_guider if phase2_guider is not None else guider
+        seg_init = current
+        noised = cn_cut is not None and seg_start < cn_cut
+        if noised:
+            seg_init = dict(current)
+            nm = current.get("noise_mask")
+            if nm is not None:
+                parts = list(nm.unbind()) if isinstance(nm, NestedTensor) else [nm]
+                vm = parts[0].clone()
+                vm[:, :, :carried] = torch.maximum(vm[:, :, :carried], torch.full_like(vm[:, :, :carried], float(level)))
+                parts[0] = vm
+                seg_init["noise_mask"] = NestedTensor(parts) if isinstance(nm, NestedTensor) else vm
         _, current = SamplerCustomAdvanced().sample(
-            noise, seg_guider, seg_sampler, seg_sigmas, current)
+            noise, seg_guider, seg_sampler, seg_sigmas, seg_init)
+        if noised:
+            # the carried rows were partially re-estimated at high sigma: put the original
+            # context back so the later (pinned) steps and the write-back see exact bytes
+            cv, ca = unpack_av(current, "segment output")
+            cv = cv.clone()
+            cv[:, :, :carried] = orig_head.to(cv.dtype)
+            current = pack_av(current, cv, ca, noise_mask=orig_mask)
     return current
 
 
@@ -515,6 +553,105 @@ class MMH3LoopingSampler(io.ComfyNode):
                             "only by whatever the input latent already carried -- see "
                             "`preserve_masks` on MiniMax H3 Split AV, which is what "
                             "lets a `use_input_audio` pin survive a split and repack."),
+                # LOCAL PATCH 2026-08-31 (pin_renorm, user-requested): appended LAST so
+                # saved graphs keep their widget order.
+                io.Float.Input(
+                    "pin_renorm_video", default=0.0, min=0.0, max=1.0, step=0.05,
+                    optional=True,
+                    tooltip="Anti-drift carry renormalization ('pin_renorm'). Before each "
+                            "chunk samples, the carried VIDEO head's per-channel latent "
+                            "mean/std are matched to chunk 1's window (0 = off, 1 = full "
+                            "renorm, between = blend). Applies to the CONTEXT the model "
+                            "sees only: after sampling, the carried span is restored "
+                            "byte-original in the master, so already-rendered frames are "
+                            "never altered -- only the NEW rows inherit the anchored "
+                            "statistics. `mask` carry only; audio untouched. The report "
+                            "prints each head's sigma-ratio vs chunk 1: a climbing ratio "
+                            "IS the drift this counters."),
+                # LOCAL PATCH 2026-09-03 (band-aware pin_renorm, user-requested):
+                # appended after pin_renorm_video, still ahead of the hidden
+                # prior_av_latent socket, so saved graphs keep their widget order.
+                io.Combo.Input(
+                    "pin_renorm_mode", options=["global", "per_band"],
+                    default="global", optional=True,
+                    tooltip="'global' (original): one per-channel mean/std match over "
+                            "the whole carried head. 'per_band': the head is split "
+                            "into three spatial frequency bands (high <~2 latent px, "
+                            "mid ~2-6, low = residual) and each band's per-channel "
+                            "sigma is matched to chunk 1's band independently. Global "
+                            "renorm caps total variance but is blind to energy "
+                            "REDISTRIBUTING between bands -- measured 2026-09-03 as "
+                            "mid-band mottle (skin blotch) doubling over ~10 chunks "
+                            "while global sigma and high-frequency energy stayed flat. "
+                            "Per-band pins the spectral profile itself. The report "
+                            "prints per-band sigma-ratios (hi/mid/lo)."),
+                # LOCAL PATCH 2026-09-07 (anti-drift research, user-approved plan): three
+                # widgets appended after pin_renorm_mode so saved graphs keep their widget
+                # order. All defaults = today's behaviour.
+                io.Float.Input(
+                    "carry_precomp", default=0.0, min=0.0, max=1.0, step=0.05, optional=True,
+                    tooltip="Per-hop bias pre-compensation (anti-drift, context-only). Root cause "
+                            "measured 2026-09-07: H3 adds a fixed-direction bias to the carried "
+                            "context's latent channel means every hop and the loop integrates it. "
+                            "With `reference_latent` wired (the SOURCE video's VAE latent aligned to "
+                            "this master, e.g. the v2v source master), the carried head's per-channel "
+                            "means are shifted toward the offset-from-reference chunk 0 had, by at "
+                            "most `carry_precomp_cap` per channel per hop, BEFORE the chunk samples; "
+                            "the master gets the original bytes back afterwards, so rendered frames "
+                            "never change and the seam only ever carries one hop's bias. 0 = off, "
+                            "1 = full correction (capped)."),
+                io.Float.Input(
+                    "carry_precomp_cap", default=0.05, min=0.0, max=1.0, step=0.01, optional=True,
+                    tooltip="Maximum per-channel mean shift applied per hop by carry_precomp "
+                            "(normalized-latent units; the measured per-hop drift is 0.02-0.05). "
+                            "Keeps every correction seam-safe."),
+                io.Float.Input(
+                    "carry_noise_level", default=0.0, min=0.0, max=1.0, step=0.05, optional=True,
+                    tooltip="Sigma-scheduled context noise (anti-drift). While sigma >= "
+                            "`carry_noise_until_sigma` the carried rows are shown to the model at "
+                            "this fractional mask value (row noise level = value*sigma, labels "
+                            "consistent -- the schedule is split into segments so H3's per-row "
+                            "timesteps match), so the exposure/tone decisions of the first steps "
+                            "cannot copy the context's fine statistics; the carried rows are then "
+                            "restored byte-original and pinned exactly for the remaining steps. "
+                            "Inpaint/denoise masks are untouched (only the carried head rows are "
+                            "affected). 0 = off."),
+                io.Float.Input(
+                    "carry_noise_until_sigma", default=0.96, min=0.0, max=1.0, step=0.01,
+                    optional=True,
+                    tooltip="carry_noise applies to the steps that START at a sigma >= this value "
+                            "(the split lands on the schedule's own sigmas). 0.96 = the first 3 of "
+                            "the 8 PDD steps (1.0, 0.988, 0.973); 0.95 = the first 4."),
+                io.Latent.Input(
+                    "reference_latent", optional=True,
+                    tooltip="For carry_precomp: the SOURCE video's H3 VAE latent (video, audio "
+                            "optional) aligned row-for-row with `latent` -- the v2v source master "
+                            "(H3ContinueMaster source_master / MMH3PackAV of the source encode) or "
+                            "a saved encode of the same footage."),
+                io.Int.Input(
+                    "reroll_retries", default=0, min=0, max=4, optional=True,
+                    tooltip="In-loop exposure-snap guard. After each carried chunk samples, its "
+                            "fresh rows are compared with the previous chunk's fresh rows (latent "
+                            "luma proxy, spatial high-frequency share, per-channel means). If any "
+                            "step exceeds `reroll_thresholds`, the chunk is re-sampled with a "
+                            "different seed (base+index+1000*attempt), up to this many retries, "
+                            "keeping the attempt with the smallest step. 0 = off (attempt 0 is "
+                            "bit-identical to the unguarded render). Each retry costs one chunk."),
+                io.String.Input(
+                    "reroll_thresholds", default="luma=0.14,hf=3.0,cmean=0.25", optional=True,
+                    tooltip="Step thresholds for the re-roll guard (units of "
+                            "scripts/h3_latent_drift_probe.py's STEP columns): luma = |delta| of "
+                            "the latent->RGB luma proxy (normal 0.02-0.08, measured exposure snap "
+                            "0.17-0.20); hf = |delta| of the spatial HF share in points (normal "
+                            "<= 2); cmean = mean |delta| of the 24 channel means (normal <= 0.2, "
+                            "snap 0.33). Those numbers are for 10 s chunks / 39 f overlap; with "
+                            "3 s chunks (53 % overlap) normal hops move much more -- calibrate per "
+                            "regime from scripts/h3_latent_drift_probe.py's STEP columns (3 s: "
+                            "luma=0.25,hf=10,cmean=0.45). A metric can be disabled with a huge value. "
+                            "With `reference_latent` wired, two optional keys score the CUMULATIVE "
+                            "deviation from chunk 0's relation to the source (a smooth walk never trips "
+                            "the step score): luma_abs=0.15,cmean_abs=0.35 -- the guard then keeps the "
+                            "attempt closest to target (best-of-N toward the source)."),
                 # HIDDEN 2026-08-21. The prior-continuation path never behaved
                 # correctly in practice, so the socket is withheld from the schema
                 # rather than deleted: `execute` still accepts `prior_av_latent=None`
@@ -533,6 +670,18 @@ class MMH3LoopingSampler(io.ComfyNode):
                 # "to line up with anything.\n\n"
                 # "Prompts map to the GENERATED chunks: cond 0 is the first chunk "
                 # "actually sampled, not the first window of the combined clip."),
+                io.Int.Input(
+                    "feather_latents", default=0, min=0, max=32, optional=True,
+                    tooltip="`mask` carry only, and VIDEO only. A linear ramp on the mask "
+                            "over N latents AFTER the carried region, easing back to full "
+                            "generation instead of stepping at the seam. 0 disables.\n\n"
+                            "Restored 2026-09-12 for re-test only; keep at 0 for renders. "
+                            "Removed in 0.73.0 because a non-zero feather made the seam "
+                            "NOISY (observed 2026-08-13). That observation stands, but "
+                            "0.76.0 retracted the mechanism recorded for it, so the cause "
+                            "is unknown. Each ramped row gets its own timestep "
+                            "(rows_t = 1 - m*sigma); on the current core those survive at "
+                            "full latent-frame resolution, unpooled and unbinarised."),
             ],
             outputs=[
                 io.Latent.Output(display_name="latent"),
@@ -548,7 +697,12 @@ class MMH3LoopingSampler(io.ComfyNode):
                 phase2_start_step=0, phase2_sampler=None, phase2_guider=None,
                 keyframes=None, keyframe_indices="", vae=None,
                 prior_av_latent=None, denoise_mask=None, denoise_mask_mode="max",
-                audio_denoise_mask=None) -> io.NodeOutput:
+                audio_denoise_mask=None, pin_renorm_video=0.0,
+                pin_renorm_mode="global", carry_precomp=0.0, carry_precomp_cap=0.05,
+                carry_noise_level=0.0, carry_noise_until_sigma=0.96, reference_latent=None,
+                reroll_retries=0,
+                reroll_thresholds="luma=0.14,hf=3.0,cmean=0.25",
+                feather_latents=0) -> io.NodeOutput:
         conds = (cond_set or {}).get("conds") or []
         if not conds:
             raise ValueError("MMH3LoopingSampler: cond_set holds no conditioning.")
@@ -834,6 +988,56 @@ class MMH3LoopingSampler(io.ComfyNode):
         # can change a render.
         preview = begin_preview(getattr(guider, "model_patcher", None), len(windows))
 
+        # LOCAL PATCH 2026-08-31 (pin_renorm, user-requested): per-channel reference
+        # stats from window 0, captured lazily at the first carry -- by then window 0
+        # holds rendered output (or, on resume, the pinned prior content). Context-only:
+        # the renormalized head is what the model conditions on; the master gets the
+        # original bytes back after write-back (same philosophy as the prior_t restore
+        # below), so the carry ratchet's stats stop compounding into NEW rows without
+        # ever editing already-rendered frames.
+        renorm_ref = None
+        pin_renorm_video = max(0.0, min(1.0, float(pin_renorm_video or 0.0)))
+        # LOCAL PATCH 2026-09-07 (re-roll guard + context-only fractional carry)
+        _rr_retries = max(0, int(reroll_retries or 0))
+        _rr_th = _reroll_parse_thresholds(reroll_thresholds)
+        _reroll_prev = None          # previous chunk's fresh-region stats (guard reference)
+        if _rr_retries > 0:
+            lines.append("  reroll guard: up to %d retries per chunk, thresholds %s"
+                         % (_rr_retries, ", ".join("%s=%g" % kv for kv in _rr_th.items())))
+        # LOCAL PATCH 2026-09-07 (anti-drift mitigations, user-approved after the root-cause verdict)
+        _pc = max(0.0, min(1.0, float(carry_precomp or 0.0)))
+        _pc_cap = max(0.0, float(carry_precomp_cap or 0.0))
+        _pc_ref0 = None
+        _ref_v = None
+        if reference_latent is not None and _pc <= 0.0:
+            # a reference without pre-compensation still serves the guard's drift scoring
+            _ref_v = unpack_av(reference_latent, "reference_latent", allow_video_only=True)[0]
+            if int(_ref_v.shape[2]) < total_t:
+                raise ValueError(
+                    "MMH3LoopingSampler: reference_latent has %d latents but the master has %d."
+                    % (int(_ref_v.shape[2]), total_t))
+        if _pc > 0.0 and reference_latent is None:
+            # production flows gate the source encode (V2V INPAINT off -> None): skip, don't fail
+            lines.append("  carry_precomp %.2f requested but no reference_latent is wired (source "
+                         "encode gated off?) -- pre-compensation SKIPPED this run" % _pc)
+            logging.warning("[MMH3LoopingSampler] %s", lines[-1].strip())
+            _pc = 0.0
+        if _pc > 0.0:
+            _ref_v = unpack_av(reference_latent, "reference_latent", allow_video_only=True)[0]
+            if int(_ref_v.shape[2]) < total_t:
+                raise ValueError(
+                    "MMH3LoopingSampler: reference_latent has %d latents but the master has %d -- "
+                    "wire a reference covering the whole master (same alignment)."
+                    % (int(_ref_v.shape[2]), total_t))
+            lines.append("  carry_precomp %.2f (cap %.3f per channel per hop): carried head's "
+                         "channel means held at chunk 0's offset from reference_latent, "
+                         "context-only (bytes restored)" % (_pc, _pc_cap))
+        _cn_level = max(0.0, min(1.0, float(carry_noise_level or 0.0)))
+        _cn_sigma = float(carry_noise_until_sigma or 0.0)
+        if _cn_level > 0.0:
+            lines.append("  carry_noise: carried rows shown at mask %.2f while sigma >= %.3f, "
+                         "then restored and pinned exactly" % (_cn_level, _cn_sigma))
+
         for i, w in enumerate(windows):
             idx = w.index_list
             v0, v1 = idx[0] + offset, min(idx[-1] + 1 + offset, total_t)
@@ -882,10 +1086,98 @@ class MMH3LoopingSampler(io.ComfyNode):
                     sub_v, sub_a, carried,
                     _audio_index_at(v0 + carried, total_t, total_a) - a0,
                     float(overlap_strength_video), float(overlap_strength_audio),
-                    in_mask_v, in_mask_a, v0, v1, a0, a1)
+                    in_mask_v, in_mask_a, v0, v1, a0, a1, int(feather_latents))
             elif in_mask_v is not None or in_mask_a is not None:
                 chunk["noise_mask"] = _sliced_mask(sub_v, sub_a, in_mask_v, in_mask_a,
                                                    v0, v1, a0, a1)
+
+            # A window whose mask keeps EVERY row (video and audio) is a no-op by
+            # construction: all rows run at the cond timestep and the write-back
+            # reproduces the input (verified 2026-08-24 at codec-noise MAE). That is
+            # exactly a resume run's pinned window (H3ContinueMaster head) or an
+            # inpaint chunk the mask never touches -- skip the sampling instead of
+            # paying a full chunk for it. Per-chunk noise is seed+index, so skipping
+            # cannot shift any other chunk's noise.
+            _nm = chunk.get("noise_mask")
+            if _nm is not None:
+                _parts = list(_nm.unbind()) if isinstance(_nm, NestedTensor) else [_nm]
+                if all(float(p.max()) <= 1e-6 for p in _parts):
+                    lines.append("  chunk %d: fully pinned -- SKIPPED (no rows to "
+                                 "denoise; content carried as-is)" % i)
+                    logging.info("[MMH3LoopingSampler] chunk %d/%d fully pinned -- "
+                                 "skipped", i + 1, n)
+                    continue
+
+            # LOCAL PATCH 2026-08-31 (pin_renorm): after the skip check so skipped
+            # windows stay untouched; chunk["samples"] aliases sub_v (pack_av wraps
+            # references), so the in-place edit reaches the sampler. Mask carry only --
+            # keyframe carry took its anchor tensor before this point and measured
+            # drift-free anyway.
+            _pr_orig_head = None
+            if pin_renorm_video > 0.0 and carried and carry != "keyframe":
+                per_band = pin_renorm_mode == "per_band"
+                if renorm_ref is None:
+                    w0 = windows[0].index_list
+                    r0 = w0[0] + offset
+                    r1 = min(w0[-1] + 1 + offset, total_t)
+                    ref_span = out_v[:, :, r0:r1]
+                    renorm_ref = (_pin_renorm_band_stats(ref_span) if per_band
+                                  else _pin_renorm_stats(ref_span))
+                    lines.append("  pin_renorm: reference = window 0 (latents %d-%d), "
+                                 "strength %.2f, mode %s, context-only"
+                                 % (r0, r1, pin_renorm_video, pin_renorm_mode))
+                _pr_orig_head = out_v[:, :, v0:v0 + carried].clone()
+                if per_band:
+                    ratios = _pin_renorm_head_band(sub_v, carried, renorm_ref,
+                                                   pin_renorm_video)
+                    lines.append("  chunk %d: pin_renorm band sigma-ratios "
+                                 "hi %.4f / mid %.4f / lo %.4f vs chunk 1 "
+                                 "(>1 = more energy than the anchor)"
+                                 % (i, ratios[0], ratios[1], ratios[2]))
+                else:
+                    ratio = _pin_renorm_head(sub_v, carried, renorm_ref,
+                                             pin_renorm_video)
+                    lines.append("  chunk %d: pin_renorm head sigma-ratio %.4f vs "
+                                 "chunk 1 (>1 = sharper/wider than the anchor)"
+                                 % (i, ratio))
+                logging.info("[MMH3LoopingSampler] %s", lines[-1].strip())
+
+            # LOCAL PATCH 2026-09-07 (anti-drift mitigations): (1) per-hop pre-compensation of
+            # the carried head's channel means against the reference (context-only; the
+            # write-back restores the bytes via _pr_orig_head); (2) sigma-scheduled context
+            # noise handed to _run_sampling as (level, until_sigma, carried).
+            _cn = None
+            if carried and carry != "keyframe":
+                if _ref_v is not None and _pc_ref0 is None:
+                    w0 = windows[0].index_list
+                    r0 = w0[0] + offset
+                    r1 = min(w0[-1] + 1 + offset, total_t)
+                    _pc_ref0 = (out_v[:, :, r0:r1].float().mean(dim=(0, 2, 3, 4))
+                                - _ref_v[:, :, r0:r1].float().mean(dim=(0, 2, 3, 4)).to(out_v.device))
+                    lines.append("  reference offset from window 0 (latents %d-%d), |offset| mean %.3f"
+                                 % (r0, r1, float(_pc_ref0.abs().mean())))
+                if _pc > 0.0:
+                    if _pc_ref0 is None:
+                        w0 = windows[0].index_list
+                        r0 = w0[0] + offset
+                        r1 = min(w0[-1] + 1 + offset, total_t)
+                        _pc_ref0 = (out_v[:, :, r0:r1].float().mean(dim=(0, 2, 3, 4))
+                                    - _ref_v[:, :, r0:r1].float().mean(dim=(0, 2, 3, 4)).to(out_v.device))
+                        lines.append("  carry_precomp: reference offset from window 0 (latents %d-%d), "
+                                     "|offset| mean %.3f" % (r0, r1, float(_pc_ref0.abs().mean())))
+                    ctx_off = (sub_v[:, :, :carried].float().mean(dim=(0, 2, 3, 4))
+                               - _ref_v[:, :, v0:v0 + carried].float().mean(dim=(0, 2, 3, 4)).to(sub_v.device))
+                    drift = ctx_off - _pc_ref0.to(ctx_off)
+                    shift = (-drift).clamp(-_pc_cap, _pc_cap) * _pc
+                    if _pr_orig_head is None:
+                        _pr_orig_head = out_v[:, :, v0:v0 + carried].clone()
+                    sub_v[:, :, :carried] += shift.view(1, -1, 1, 1, 1).to(sub_v.dtype)
+                    lines.append("  chunk %d: carry_precomp drift-vs-reference MAE %.3f (max %.3f) "
+                                 "-> shift MAE %.3f" % (i, float(drift.abs().mean()),
+                                                        float(drift.abs().max()), float(shift.abs().mean())))
+                    logging.info("[MMH3LoopingSampler] %s", lines[-1].strip())
+                if _cn_level > 0.0:
+                    _cn = (_cn_level, _cn_sigma, carried)
 
             if chunk_guides:
                 if _has_refs(chunk_cond) and not _guide_origin_correct():
@@ -909,15 +1201,55 @@ class MMH3LoopingSampler(io.ComfyNode):
                 # Before, not after: the per-step callback fires during the sample
                 # and needs to know which chunk it is watching.
                 preview.set_chunk(i, v0, v1)
-            done = _run_sampling(
-                _chunk_noise(noise, i), g, sampler, sigmas, chunk,
-                sampling_start_step, sampling_end_step,
-                phase2_sampler, g2, phase2_start_step)
+            # LOCAL PATCH 2026-09-07 (re-roll guard): a guarded chunk may be sampled more
+            # than once; the reference is the previous chunk's fresh rows (else the carried
+            # head bytes). With the guard active every attempt's guider carries
+            # transformer_options["mmh3_reroll_attempt"], which tells H3ChunkPreviewTap to
+            # defer its per-chunk preview/verdict until the kept attempt is emitted below.
+            _rr_ref = None
+            if _rr_retries > 0 and carried and carry != "keyframe":
+                _rr_ref = _reroll_prev if _reroll_prev is not None else _fresh_stats(
+                    _pr_orig_head if _pr_orig_head is not None
+                    else out_v[:, :, v0:v0 + carried])
+
+            def _run_once(nz, attempt, _g=g, _g2=g2):
+                ga, g2a = _g, _g2
+                if _rr_retries > 0:
+                    ga = _mark_attempt(_g, attempt)
+                    g2a = None if _g2 is None else _mark_attempt(_g2, attempt)
+                return _run_sampling(nz, ga, sampler, sigmas, chunk,
+                                     sampling_start_step, sampling_end_step,
+                                     phase2_sampler, g2a, phase2_start_step,
+                                     carry_noise=_cn)
+
+            _rr_drift = None
+            if (_rr_ref is not None and _ref_v is not None and _pc_ref0 is not None
+                    and (_rr_th.get("luma_abs", 0.0) > 0.0 or _rr_th.get("cmean_abs", 0.0) > 0.0)):
+                _rr_drift = (_fresh_stats(_ref_v[:, :, v0 + carried:v1]), _pc_ref0)
+            done, _rr_kept, _rr_stats = _sample_with_reroll(
+                _run_once, noise, i, _rr_retries if _rr_ref is not None else 0,
+                _rr_ref, _rr_th, carried, lines, drift=_rr_drift)
+            if _rr_retries > 0:
+                _emit = getattr(g, "h3_tap_emit", None)
+                if callable(_emit):
+                    try:
+                        _emit(done["samples"], sigmas)
+                    except Exception as e:  # a preview must never kill the run
+                        logging.warning("[MMH3LoopingSampler] chunk %d: tap emit failed (%s: %s)",
+                                        i, type(e).__name__, e)
 
             dv, da = unpack_av(done, "chunk %d output" % i)
             out_v[:, :, v0:v1] = dv.to(out_v.dtype)
             if out_a is not None and da is not None:
                 out_a[:, :, :, a0:a1] = da.to(out_a.dtype)
+            # LOCAL PATCH 2026-08-31 (pin_renorm): the renormalized head has done its
+            # job as context; restore the original bytes so already-rendered overlap
+            # frames are never altered (mirrors the prior_t restore below).
+            if _pr_orig_head is not None:
+                out_v[:, :, v0:v0 + carried] = _pr_orig_head
+            if _rr_retries > 0:
+                _reroll_prev = (_rr_stats if _rr_stats is not None
+                                else _fresh_stats(out_v[:, :, v0 + carried:v1]))
 
             lines.append("  chunk %d: prompt %d, frames %d-%d, %d carried%s"
                          % (i, min(i, len(conds) - 1), spans[i][0], spans[i][1],
@@ -1087,8 +1419,257 @@ def _sliced_mask(sub_v, sub_a, in_v, in_a, v0, v1, a0, a1):
     return NestedTensor([vm, am]) if am is not None else vm
 
 
+# LOCAL PATCH 2026-08-31 (pin_renorm, user-requested) ------------------------
+def _pin_renorm_stats(v):
+    """Per-channel float32 mean/std of a video latent span [B,C,T,H,W]."""
+    x = v.to(torch.float32)
+    return x.mean(dim=(0, 2, 3, 4)), x.std(dim=(0, 2, 3, 4))
+
+
+def _pin_renorm_head(sub_v, carried, ref_stats, strength):
+    """Match the carried head's per-channel latent stats to the reference.
+
+    In-place on sub_v's first `carried` rows: x' = (x-mu)/sd * ref_sd + ref_mu,
+    blended by `strength`. Channels with degenerate spread are left alone.
+    Returns the mean pre-renorm sigma-ratio (head_sd / ref_sd) over the
+    non-degenerate channels -- the latent-space drift meter for the report.
+    """
+    ref_mean, ref_std = ref_stats
+    head = sub_v[:, :, :carried].to(torch.float32)
+    mu = head.mean(dim=(0, 2, 3, 4), keepdim=True)
+    sd = head.std(dim=(0, 2, 3, 4), keepdim=True)
+    rm = ref_mean.view(1, -1, 1, 1, 1).to(head.device)
+    rs = ref_std.view(1, -1, 1, 1, 1).to(head.device)
+    ok = (sd > 1e-6) & (rs > 1e-6)
+    target = torch.where(ok, (head - mu) / sd.clamp_min(1e-6) * rs + rm, head)
+    blended = head + float(strength) * (target - head)
+    sub_v[:, :, :carried] = blended.to(sub_v.dtype)
+    ratios = (sd / rs.clamp_min(1e-6)).reshape(-1)[ok.reshape(-1)]
+    return float(ratios.mean().item()) if ratios.numel() else 1.0
+
+
+# LOCAL PATCH 2026-09-03 (band-aware pin_renorm, user-requested) -------------
+# Global renorm caps the carried head's TOTAL per-channel variance but cannot
+# stop drift from redistributing energy between spatial frequency bands inside
+# that budget -- measured 2026-09-03 as mid-band mottle (skin blotch) roughly
+# doubling over ~10 chunks while global sigma and high-frequency lapvar stayed
+# flat. Per-band mode splits the head into three spatial bands per latent frame
+# (gaussian blurs at sigma 1 and 3 latent px: high = x - G1, mid = G1 - G3,
+# low = G3) and matches each band's per-channel sigma to chunk 1's band
+# independently (the low band also matches the mean; high/mid are ~zero-mean by
+# construction). Bands sum exactly back to the input, so strength blending and
+# the byte-original write-back restore behave exactly like global mode.
+
+_PIN_BAND_SIGMAS = (1.0, 3.0)
+
+
+def _pin_gauss_blur(flat, sigma):
+    """Separable replicate-pad gaussian blur on [N,C,H,W] float32."""
+    import torch.nn.functional as F
+    c = flat.shape[1]
+    k = max(3, int(sigma * 4) | 1)
+    g = torch.arange(k, dtype=torch.float32, device=flat.device) - k // 2
+    g = torch.exp(-g * g / (2.0 * sigma * sigma))
+    g = g / g.sum()
+    kx = g.view(1, 1, 1, k).expand(c, 1, 1, k)
+    ky = g.view(1, 1, k, 1).expand(c, 1, k, 1)
+    p = k // 2
+    out = F.conv2d(F.pad(flat, (p, p, 0, 0), mode="replicate"), kx, groups=c)
+    return F.conv2d(F.pad(out, (0, 0, p, p), mode="replicate"), ky, groups=c)
+
+
+def _pin_band_split(x):
+    """[B,C,T,H,W] float32 -> (high, mid, low) bands, summing exactly to x."""
+    b, c, t, h, w = x.shape
+    flat = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+    g1 = _pin_gauss_blur(flat, _PIN_BAND_SIGMAS[0])
+    g3 = _pin_gauss_blur(flat, _PIN_BAND_SIGMAS[1])
+    def back(y):
+        return y.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4)
+    return back(flat - g1), back(g1 - g3), back(g3)
+
+
+def _pin_renorm_band_stats(v):
+    """Per-band, per-channel float32 (mean, std) of a video latent span."""
+    bands = _pin_band_split(v.to(torch.float32))
+    return [(b.mean(dim=(0, 2, 3, 4)), b.std(dim=(0, 2, 3, 4))) for b in bands]
+
+
+def _pin_renorm_head_band(sub_v, carried, ref_band_stats, strength,
+                          iterations=3):
+    """Per-band variant of _pin_renorm_head: each band's per-channel sigma is
+    matched to its chunk-1 band (low band also matches the mean), bands are
+    recomposed, and the whole correction is blended by `strength`. In-place on
+    sub_v's first `carried` rows. Returns (hi, mid, lo) mean pre-renorm
+    sigma-ratios over non-degenerate channels -- the per-band drift meter.
+
+    Gaussian bands overlap (not orthogonal projections), so a single
+    fix-and-recompose under-corrects: re-splitting the result leaks energy
+    between bands. The correction is therefore iterated to a fixed point
+    (3 rounds ≈ band sigmas within a few percent) before the single
+    strength-blend against the original head."""
+    head = sub_v[:, :, :carried].to(torch.float32)
+    ratios = None
+    cur = head
+    for _ in range(max(1, int(iterations))):
+        bands = _pin_band_split(cur)
+        fixed_sum = torch.zeros_like(cur)
+        round_ratios = []
+        for bi, (band, (rm, rs)) in enumerate(zip(bands, ref_band_stats)):
+            mu = band.mean(dim=(0, 2, 3, 4), keepdim=True)
+            sd = band.std(dim=(0, 2, 3, 4), keepdim=True)
+            rmv = rm.view(1, -1, 1, 1, 1).to(band.device)
+            rsv = rs.view(1, -1, 1, 1, 1).to(band.device)
+            ok = (sd > 1e-6) & (rsv > 1e-6)
+            if bi == 2:  # low band carries the DC level
+                fixed = (band - mu) / sd.clamp_min(1e-6) * rsv + rmv
+            else:        # high/mid are ~zero-mean: pure sigma rescale
+                fixed = band * (rsv / sd.clamp_min(1e-6))
+            fixed_sum = fixed_sum + torch.where(ok, fixed, band)
+            r = (sd / rsv.clamp_min(1e-6)).reshape(-1)[ok.reshape(-1)]
+            round_ratios.append(float(r.mean().item()) if r.numel() else 1.0)
+        if ratios is None:
+            ratios = tuple(round_ratios)  # report the PRE-renorm drift
+        cur = fixed_sum
+    blended = head + float(strength) * (cur - head)
+    sub_v[:, :, :carried] = blended.to(sub_v.dtype)
+    return ratios
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# LOCAL PATCH 2026-09-07: in-loop re-roll guard (exposure-snap detector) helpers.
+# Root cause measured on saved masters (scripts/h3_latent_drift_probe.py): the carried
+# head is the model's own previous output shown as a clean reference; its statistics
+# drift off the natural VAE-latent distribution chunk over chunk and, at some chunk, the
+# high-sigma decisions (exposure/tone) snap back to the prior. Identical seeds snap at the
+# same chunk; a different seed usually does not. The guard measures the same three latent
+# statistics the probe prints and re-samples a snapped chunk with a different seed.
+# ---------------------------------------------------------------------------
+_REROLL_DEFAULTS = {"luma": 0.14, "hf": 3.0, "cmean": 0.25,
+                    # cumulative deviation from the chunk-0 relation to `reference_latent`
+                    # (only scored when a reference is wired); 0 = off
+                    "luma_abs": 0.0, "cmean_abs": 0.0}
+_RGB_FACTORS = None
+
+
+def _rgb_factors():
+    global _RGB_FACTORS
+    if _RGB_FACTORS is None:
+        from comfy.latent_formats import MiniMaxH3Video
+        w = torch.tensor(MiniMaxH3Video.latent_rgb_factors, dtype=torch.float32)
+        b = getattr(MiniMaxH3Video, "latent_rgb_factors_bias", None)
+        b = torch.tensor(b, dtype=torch.float32) if b is not None else torch.zeros(3)
+        _RGB_FACTORS = (w, b)
+    return _RGB_FACTORS
+
+
+def _reroll_parse_thresholds(text):
+    th = dict(_REROLL_DEFAULTS)
+    for part in str(text or "").replace(";", ",").split(","):
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        k = k.strip().lower()
+        if k in th:
+            try:
+                th[k] = max(0.0 if k.endswith("_abs") else 1e-6, float(v))
+            except ValueError:
+                pass
+    return th
+
+
+def _fresh_stats(v):
+    """Latent stats of a [B,C,t,H,W] region: luma proxy (latent->RGB, same einsum as the
+    probe, no 0..1 remap), spatial HF share (residual after a replicate-padded 3x3 box
+    blur, in % of the total std) and the per-channel means."""
+    x = v.detach().float().cpu()
+    if x.ndim != 5 or x.shape[2] == 0:
+        return {"luma": 0.0, "hf": 0.0, "ch_mean": torch.zeros(x.shape[1] if x.ndim == 5 else 24)}
+    w, b = _rgb_factors()
+    c = min(int(x.shape[1]), int(w.shape[0]))
+    rgb = torch.einsum("bcthw,ck->bkthw", x[:, :c], w[:c]) + b.view(1, 3, 1, 1, 1)
+    luma = 0.2126 * rgb[:, 0] + 0.7152 * rgb[:, 1] + 0.0722 * rgb[:, 2]
+    tot = float(x.std())
+    xp = torch.nn.functional.pad(x, (1, 1, 1, 1, 0, 0), mode="replicate")
+    blur = torch.nn.functional.avg_pool3d(xp, (1, 3, 3), stride=1)
+    hf = 100.0 * float((x - blur).std()) / max(tot, 1e-6)
+    return {"luma": float(luma.mean()), "hf": hf, "ch_mean": x.mean(dim=(0, 2, 3, 4))}
+
+
+def _reroll_score(stats, ref, th, drift=None):
+    """Step score vs the previous chunk (`ref`), plus -- when `drift` = (source_stats_of_fresh_rows,
+    target_offset_ch_mean) is given and the *_abs thresholds are set -- the attempt's CUMULATIVE
+    deviation from the chunk-0 relation to the reference (a walk that continues smoothly never
+    trips the step score; this term lets the guard pick the attempt closest to target)."""
+    d_luma = float(stats["luma"] - ref["luma"])
+    d_hf = float(stats["hf"] - ref["hf"])
+    d_cm = float((stats["ch_mean"] - ref["ch_mean"]).abs().mean())
+    parts = {"luma": abs(d_luma) / th["luma"], "hf": abs(d_hf) / th["hf"], "cmean": d_cm / th["cmean"]}
+    deltas = {"luma": d_luma, "hf": d_hf, "cmean": d_cm}
+    if drift is not None:
+        src_stats, target_off = drift
+        off = stats["ch_mean"] - src_stats["ch_mean"]           # this attempt's offset from the source
+        dev = off - target_off.to(off)                          # ... relative to chunk 0's offset
+        w, b = _rgb_factors()
+        luma_dev = float((dev.view(1, -1) @ w[:dev.numel()]).squeeze(0) @ torch.tensor([0.2126, 0.7152, 0.0722]))
+        cm_dev = float(dev.abs().mean())
+        deltas["luma_abs"] = luma_dev
+        deltas["cmean_abs"] = cm_dev
+        if th.get("luma_abs", 0.0) > 0.0:
+            parts["luma_abs"] = abs(luma_dev) / th["luma_abs"]
+        if th.get("cmean_abs", 0.0) > 0.0:
+            parts["cmean_abs"] = cm_dev / th["cmean_abs"]
+    return max(parts.values()), parts, deltas
+
+
+def _mark_attempt(guider, attempt):
+    """Per-attempt guider copy tagged with transformer_options['mmh3_reroll_attempt'] (both
+    option levels rebound, like _chunk_guider), so taps can tell attempts apart."""
+    new_g = copy.copy(guider)
+    opts = dict(getattr(guider, "model_options", {}) or {})
+    opts["transformer_options"] = dict(opts.get("transformer_options", {}))
+    opts["transformer_options"]["mmh3_reroll_attempt"] = int(attempt)
+    new_g.model_options = opts
+    return new_g
+
+
+def _sample_with_reroll(run_once, noise, i, retries, ref, th, carried, lines, drift=None):
+    """Sample chunk i up to retries+1 times. Attempt a uses seed base+i+1000*a (attempt 0 ==
+    the unguarded seed). Returns (kept_output, kept_attempt, kept_fresh_stats or None)."""
+    best = None
+    attempt = 0
+    for attempt in range(int(retries) + 1):
+        nz = _chunk_noise(noise, i + 1000 * attempt) if attempt else _chunk_noise(noise, i)
+        done = run_once(nz, attempt)
+        if ref is None or int(retries) <= 0:
+            return done, 0, None
+        dv, _ = unpack_av(done, "chunk %d attempt %d" % (i, attempt))
+        st = _fresh_stats(dv[:, :, carried:])
+        score, parts, d = _reroll_score(st, ref, th, drift)
+        seed_txt = getattr(nz, "seed", "?")
+        lines.append("  chunk %d: reroll attempt %d (seed %s) -> dluma %+.3f dhf %+.2f "
+                     "cmean %.3f%s score %.2f%s"
+                     % (i, attempt, seed_txt, d["luma"], d["hf"], d["cmean"],
+                        (" | vs target: luma %+.3f cmean %.3f" % (d["luma_abs"], d["cmean_abs"]))
+                        if "luma_abs" in d else "", score,
+                        "" if score <= 1.0 else "  EXCEEDS (%s)" % ", ".join(
+                            k for k, v in parts.items() if v > 1.0)))
+        logging.info("[MMH3LoopingSampler] %s", lines[-1].strip())
+        if best is None or score < best[0]:
+            best = (score, done, attempt, st)
+        if score <= 1.0:
+            break
+    if attempt > 0 or best[0] > 1.0:
+        lines.append("  chunk %d: reroll kept attempt %d (score %.2f%s)"
+                     % (i, best[2], best[0], "" if best[0] <= 1.0 else ", still over threshold"))
+        logging.info("[MMH3LoopingSampler] %s", lines[-1].strip())
+    return best[1], best[2], best[3]
+# ---------------------------------------------------------------------------
+
+
 def _carry_mask(sub_v, sub_a, carried, carried_a, strength_v, strength_a,
-                in_v, in_a, v0, v1, a0, a1):
+                in_v, in_a, v0, v1, a0, a1, feather=0):
     """Preserve the carried head, honouring any mask the master already had.
 
     Starts from the master's own mask for this span -- a pinned audio track has
@@ -1109,9 +1690,29 @@ def _carry_mask(sub_v, sub_a, carried, carried_a, strength_v, strength_a,
     else:
         vm, am = packed, None
 
-    vm[:, :, :carried] = 1.0 - strength_v
+    # keep-wins (clamp, not overwrite): the master's own mask may already PIN part
+    # of the carry span harder than the carry strength does -- an inpaint keep
+    # region, a use_input_audio track. Overwriting re-noised those pins by
+    # (1 - strength) every carry head (local patch 2026-08-24; identical when the
+    # master carried no mask, since the slice is then all ones).
+    vm[:, :, :carried] = vm[:, :, :carried].clamp(max=1.0 - strength_v)
     if am is not None and carried_a > 0:
-        am[:, :, :, :carried_a] = 1.0 - strength_a
+        am[:, :, :, :carried_a] = am[:, :, :, :carried_a].clamp(max=1.0 - strength_a)
+
+    # RESTORED 2026-09-12 for re-test, exactly as removed in 0.73.0: a linear ramp over
+    # the first `feather` NEW rows, easing back to full generation instead of stepping at
+    # the seam. VIDEO only. Composes with MINIMUM so easing toward full denoise cannot
+    # un-pin something deliberately kept. 0 = off = byte-identical to the hard step.
+    # The 0.72.2 observation (a non-zero feather made the seam NOISY) stands unexplained:
+    # 0.76.0 retracted its recorded mechanism. Leave at 0 outside the A/B.
+    if feather > 0:
+        end = min(carried + int(feather), vm.shape[2])
+        steps = end - carried
+        if steps > 0:
+            ramp = torch.linspace(1.0 - strength_v, 1.0, steps + 1,
+                                  device=vm.device)[1:]
+            vm[:, :, carried:end] = torch.minimum(ramp.view(1, 1, steps, 1, 1),
+                                                  vm[:, :, carried:end])
     return NestedTensor([vm, am]) if am is not None else vm
 
 
