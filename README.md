@@ -6,6 +6,12 @@ splicing for **chained long-form generation**.
 [Apply H3 RefMods to Cond Set](docs/refmods.md) injects a MiniMaxH3Mod bundle into
 every chunk's conditioning while keeping trailing control references in place.
 
+[Context frames and a second stage per chunk](docs/two-stage-looping.md) (fork):
+MMH3LoopingSampler can pin only the last N carried frames (`overlap_pin = tail_custom`)
+and finish every chunk with its own model and sigmas (`stage2_guider` / `stage2_sigmas`),
+optionally after a learned latent upscale (`upscale_model`). Defaults are unchanged.
+Not yet render-validated.
+
 ## What has actually been run
 
 **`carry="mask"` is the tested path.** Every example workflow ships with it, and every
