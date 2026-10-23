@@ -43,6 +43,12 @@ conditioning first -- an upstream guide node or a cond cached from a previous
 run would anchor this chunk to somebody else's frames. Straight from
 LTXAVTools, where the same leak had the same cause.
 
+That is also why a guide VIDEO has to come in here rather than through core's
+Add Guide: `guide_video` is cut per chunk, each span encoded as its own clip and
+anchored at that chunk's frame 0, so every chunk is guided by the source frames
+it actually renders. The single-generation equivalent is core's Add Guide; this
+is the same thing, windowed.
+
 GUIDER COPYING is the part that is easy to get wrong. copy.copy is shallow, so
 new_g.original_conds is the SAME dict object as the source guider's, and
 set_conds assigns into it -- chunk 0 would overwrite the BASE conditioning and
@@ -70,6 +76,7 @@ from .common import (AUDIO_LATENT_FPS, AUDIO_T_DIM, FPS, LATENTS_PER_GROUP,
 from .nodes_loop import per_row_mask_is_continuous
 from .nodes_multiprompt import MMH3CondSet
 from .nodes_preview import begin_preview
+from .nodes_loop import masked_velocity_is_scaled
 from .nodes_windows import _audio_index_at, _plan, _window_frame_spans
 
 _GUIDE_KEYS = ("minimax_keyframes", "minimax_frame_count")
@@ -361,6 +368,17 @@ def _fit_keyframe(px, tgt_w, tgt_h, is_opener):
                     "stretch" if is_opener else "centre crop"))
 
 
+def _guide_clip_frames(n):
+    """Frames of a guide clip cut from `n` available: the largest valid H3 clip length
+    (17k+5) that fits, as core's Add Guide crops a batch. 0 when fewer than 5 remain --
+    core would fall back to a single still there, which for a guide VIDEO would be a
+    different thing from what was asked, so the chunk gets no guide instead."""
+    n = int(n)
+    if n < 5:
+        return 0
+    return n - (n - 5) % 17
+
+
 def _owner(spans, overlap_frames, g):
     """Which chunk RENDERS global frame g, and its local frame there.
 
@@ -518,7 +536,8 @@ class MMH3LoopingSampler(io.ComfyNode):
                             "a typo rather than a count."),
                 io.Vae.Input(
                     "vae", optional=True,
-                    tooltip="The H3 VIDEO vae, needed only to encode `keyframes`."),
+                    tooltip="The H3 VIDEO vae, needed only to encode `keyframes` and "
+                            "`guide_video`."),
                 io.Mask.Input(
                     "denoise_mask", optional=True,
                     tooltip="Denoise mask for the VIDEO half over the WHOLE clip: WHITE "
@@ -657,8 +676,10 @@ class MMH3LoopingSampler(io.ComfyNode):
                 # correctly in practice, so the socket is withheld from the schema
                 # rather than deleted: `execute` still accepts `prior_av_latent=None`
                 # and the prepend/pad/phase implementation below is untouched.
-                # Restore by uncommenting -- it was the LAST input, so putting it
-                # back appends and cannot disturb widget order in saved graphs.
+                # Restore by MOVING it to the end of this list, after guide_video
+                # (added 0.105.0 while this was hidden). Uncommenting it in place
+                # would insert it ahead of guide_video and shift that socket in
+                # saved graphs.
                 # io.Latent.Input(
                 # "prior_av_latent", optional=True,
                 # tooltip="An already-rendered AV latent to continue from. It is copied "
@@ -683,6 +704,26 @@ class MMH3LoopingSampler(io.ComfyNode):
                             "is unknown. Each ramped row gets its own timestep "
                             "(rows_t = 1 - m*sigma); on the current core those survive at "
                             "full latent-frame resolution, unpooled and unbinarised."),
+                io.Image.Input(
+                    "guide_video", optional=True,
+                    tooltip="Source frames pinned as a GUIDE CLIP under every chunk, on "
+                            "the output's own clock: 24 fps, its frame 0 is the clip's "
+                            "frame 0. Each chunk takes its own span, encodes it as one "
+                            "clip and anchors it at the chunk's frame 0 -- core's Add "
+                            "Guide, windowed, so a long clip stays frame-aligned with "
+                            "its source.\n\n"
+                            "A full-clip guide needs a LoRA trained on guide latents (an "
+                            "edit or style-transfer LoRA); the base model is trained only "
+                            "for first/last-frame anchors. Needs #15439 and `vae`.\n\n"
+                            "Centre-cropped to the generation's grid. Shorter than the "
+                            "clip: later chunks get what is left, cut to a valid clip "
+                            "length (17k+5 frames), or nothing; longer: the excess is "
+                            "unused. Both are reported. A guide roughly doubles each "
+                            "chunk's sequence, so chunks run slower and a smaller "
+                            "chunk_frames may be needed. Picture only -- to keep the "
+                            "source's sound, use use_input_audio upstream.\n\n"
+                            "Not with carry='keyframe' or `keyframes`: both would put a "
+                            "second guide on the same frames."),
                 # FORK 2026-10-23: context frames and a second stage per chunk (see
                 # two_stage.py). Appended after every existing input so saved graphs keep
                 # their widget values; every default reproduces the sampler as it was.
@@ -783,7 +824,7 @@ class MMH3LoopingSampler(io.ComfyNode):
                 carry_noise_level=0.0, carry_noise_until_sigma=0.96, reference_latent=None,
                 reroll_retries=0,
                 reroll_thresholds="luma=0.14,hf=3.0,cmean=0.25",
-                feather_latents=0, overlap_pin="full", context_frames=5,
+                feather_latents=0, guide_video=None, overlap_pin="full", context_frames=5,
                 accepted_prefix_frames=0, stage2_guider=None, stage2_sampler=None,
                 stage2_sigmas=None, upscale_model=TS.UPSCALE_NONE, upscale_megapixels=1.0,
                 upscale_precision="fp32", upscale_temporal_chunking=False,
@@ -921,9 +962,11 @@ class MMH3LoopingSampler(io.ComfyNode):
                  "overlap %d latents (%d frames)"
                  % (n, "" if n == 1 else "s", length, latents_to_frames(length),
                     total_f, total_f / float(FPS), overlap, ov_frames),
-                 "carry %s, strength video %.2f / audio %.2f, noise seed %s"
+                 "carry %s, strength video %.2f / audio %.2f, noise seed %s, "
+                 "core scales masked velocity (#15988): %s"
                  % (carry, float(overlap_strength_video), float(overlap_strength_audio),
-                    getattr(noise, "seed", "?"))]
+                    getattr(noise, "seed", "?"),
+                    "yes" if masked_velocity_is_scaled() else "no")]
         if prior_t:
             lines.append("prior: %d latents (%d frames, %.2fs) kept verbatim; generating "
                          "from frame %d, carrying %d frames of it"
@@ -1075,6 +1118,35 @@ class MMH3LoopingSampler(io.ComfyNode):
                         {"resolved_frame_index": int(local), "latent": vae.encode(px_hi)})
                 lines.append("  keyframe frame %d -> chunk %d local frame %d%s"
                              % (g, ci, local, "" if not note else ", resized " + note))
+
+        # ---- guide video: checked once, cut and encoded per chunk below ------
+        if guide_video is not None:
+            if vae is None:
+                raise ValueError("MMH3LoopingSampler: guide_video needs the H3 video vae.")
+            if not _guides_available():
+                raise RuntimeError(
+                    "MMH3LoopingSampler: guide_video needs any-index guides (PR #15439).")
+            # Two guides on the same frames is not a combination anyone has trained
+            # for, so refuse it rather than hand the model something undefined.
+            if carry == "keyframe":
+                raise ValueError(
+                    "MMH3LoopingSampler: guide_video and carry='keyframe' both anchor a "
+                    "guide at every chunk's frame 0. Use carry='mask' with guide_video.")
+            if keyframes is not None and wanted:
+                raise ValueError(
+                    "MMH3LoopingSampler: guide_video already covers every frame, so "
+                    "`keyframes` would put a second guide on frames it guides. Use one.")
+            gv_n = int(guide_video.shape[0])
+            lines.append("  guide_video: %d frames for a %d-frame clip%s"
+                         % (gv_n, total_f,
+                            "" if gv_n == total_f else
+                            " -- the last %d are unused" % (gv_n - total_f) if gv_n > total_f
+                            else " -- it runs out at frame %d; later chunks get less or "
+                                 "nothing" % gv_n))
+            if gv_n != total_f:
+                logging.warning("[MMH3LoopingSampler] %s", lines[-1].strip())
+        gv_h = int(master_v.shape[3]) * VAE_SPATIAL
+        gv_w = int(master_v.shape[4]) * VAE_SPATIAL
 
         # ---- fill the master, chunk by chunk --------------------------------
         out_v = master_v.clone()
@@ -1393,6 +1465,27 @@ class MMH3LoopingSampler(io.ComfyNode):
                     _cn = (_cn_level, _cn_sigma, carried)
 
             base_cond = chunk_cond
+            # This chunk's span of the guide video, encoded as ONE clip and anchored at
+            # the chunk's frame 0 -- what core's Add Guide does, per chunk. Encoding the
+            # span fresh (rather than slicing one whole-clip encode) gives every chunk
+            # a clip whose first token is a real 1-frame token, which is how a guide
+            # clip is built for a single generation and so what guide LoRAs trained on.
+            # Windows start on phase 0, so the span is a valid 17k+5-frame clip.
+            gv_note = ""
+            if guide_video is not None:
+                f0 = frame_at_latent(v0)
+                want_f = frame_at_latent(v1) - f0
+                gf = _guide_clip_frames(min(want_f, int(guide_video.shape[0]) - f0))
+                if gf:
+                    px, fit = _fit_keyframe(guide_video[f0:f0 + gf], gv_w, gv_h,
+                                            is_opener=False)
+                    chunk_guides.append({"resolved_frame_index": 0, "latent": vae.encode(px)})
+                    gv_note = ", guide frames %d-%d%s%s" % (
+                        f0, f0 + gf - 1, "" if gf == want_f else " (short: %d of %d)"
+                        % (gf, want_f), "" if not fit else ", resized " + fit)
+                else:
+                    gv_note = ", no guide (the guide video ended)"
+
             if chunk_guides:
                 if _has_refs(chunk_cond) and not _guide_origin_correct():
                     raise RuntimeError(
@@ -1556,12 +1649,11 @@ class MMH3LoopingSampler(io.ComfyNode):
                 _reroll_prev = (_rr_stats if _rr_stats is not None
                                 else _fresh_stats(fin_v[:, :, v0 + carried:v1]))
 
-            lines.append("  chunk %d: prompt %d, frames %d-%d, %d carried%s"
+            lines.append("  chunk %d: prompt %d, frames %d-%d, %d carried%s%s"
                          % (i, min(i, len(conds) - 1), spans[i][0], spans[i][1],
                             frame_at_latent(carried) if carried else 0,
-                            ", %d keyframe(s)" % (len(chunk_guides) - (1 if carried
-                                                  and carry == "keyframe" else 0))
-                            if guides_by_chunk.get(i) else ""))
+                            ", %d keyframe(s)" % len(guides_by_chunk[i])
+                            if guides_by_chunk.get(i) else "", gv_note))
             if (tail_mode and carried) or stage2_on:
                 lines[-1] += "".join([
                     (", context %d of %d carried latents pinned (%d frames), %d redrawn"
@@ -1570,7 +1662,7 @@ class MMH3LoopingSampler(io.ComfyNode):
                     if tail_mode and carried else "",
                     ", stage 2 done" if stage2_on else ""])
             if preview is not None:
-                preview.chunk(i, dv, v0, v1)
+                preview.chunk(i, dv, v0, v1, da)
             logging.info("[MMH3LoopingSampler] chunk %d/%d done", i + 1, n)
 
         # The first generated chunk OVERLAPS the prior -- that is what the carry is --

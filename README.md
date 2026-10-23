@@ -36,6 +36,33 @@ Note that current ComfyUI also raised its own floor to **`av>=17.0.0`**. If you 
 core and ComfyUI then fails to start with `cannot import name 'ColorPrimaries' from
 'av.video.reformatter'`, that is why — `pip install --upgrade "av>=17.0.0"`.
 
+**Verified on `v0.34.0-200-g79be670e` (2026-09-25)** with `comfy-aimdo==0.5.5`,
+`comfy-kitchen==0.2.35`.
+
+**No torchaudio needed.** ComfyUI dropped torchaudio as a dependency in
+[#16457](https://github.com/Comfy-Org/ComfyUI/pull/16457) (2026-09-21). This pack used
+it in two nodes and no longer does: `resample_audio()` prefers core's own
+`comfy.audio.resample` and falls back to torchaudio only on a pre-#16457 core, so
+MMH3 Forced Align and MMH3 Music Analysis work on a clean install either way. The
+substitution is bit-identical on the conversions involved (see `tests/test_resample.py`). Updating ComfyUI means updating those pinned components too:
+core does a module-level `import comfy_aimdo.malloc_graph`, which does not exist
+before aimdo 0.5.x, so core and aimdo cannot be moved independently.
+
+> ⚠️ **`RuntimeError: aimdo memory compile error`.** ComfyUI shipped a model compiler
+> (`comfy-aimdo` 0.5.x, opt-OUT) whose integration lives inside H3's own forward pass,
+> so H3 graphs hit it disproportionately. If a generation raises this — reported with
+> the ControlNet nodes in particular — launch with **`--disable-comfy-compiler`**
+> (which also forces `--disable-cuda-graphs`). It is a core issue, not a pack issue:
+> nothing in this pack references aimdo.
+
+> **#15988 changes what `carry="mask"` computes.** The model now scales masked rows'
+> velocity by the mask (`out *= denoise_mask`) to match the outer x0 conversion. The
+> pack does not require it and is not gated on it, but a render made before and after
+> that merge is not numerically the same run. `MMH3LoopingSampler`'s summary reports
+> `core scales masked velocity (#15988): yes/no` on every run so the two are
+> distinguishable in a log. What it does to output at intermediate
+> `overlap_strength` values has not been measured here.
+
 Everything this pack needs from upstream has merged:
 
 | PR | merged | needed by |
@@ -43,6 +70,7 @@ Everything this pack needs from upstream has merged:
 | [#15375](https://github.com/Comfy-Org/ComfyUI/pull/15375) per-token masking | 2026-08-18 | `MMH3SeedOverlap`, latent outpaint, and **`MMH3LoopingSampler` with `carry="mask"`** — the default |
 | [#15439](https://github.com/Comfy-Org/ComfyUI/pull/15439) guides at any frame | 2026-08-13 | `MMH3LoopingSampler` with `carry="keyframe"`, and any use of `keyframes` |
 | [#15808](https://github.com/Comfy-Org/ComfyUI/pull/15808) H3's seven special tokens | 2026-08-22 | nothing in the pack — it makes `MMH3OfficialTokens` redundant, see below |
+| [#15988](https://github.com/Comfy-Org/ComfyUI/pull/15988) masked-row velocity scaling | 2026-09-09 | nothing — but it CHANGES `carry="mask"` numerics, see below |
 
 On an older ComfyUI the pack does not pretend. `MMH3SeedOverlap` and the keyframe path
 **refuse to run**, and the looping sampler checks before it starts.
@@ -286,23 +314,19 @@ applied to core (a draft) and the union checkpoint in `models/controlnet/`. See
 `CannyEdgePreprocessor`, `DepthAnythingV2Preprocessor`, `HEDPreprocessor`,
 `M-LSDPreprocessor`, `OpenposePreprocessor`/`DWPreprocessor` — so raw video in is fine.
 
-**`SolAttnMiniMax` is Kijai's single-file Sol-Attn node**
-([arXiv 2607.24027](https://arxiv.org/abs/2607.24027)), which reaches H3's attention
-through comfy-kitchen's CUDA kernels — it wants `comfy_kitchen` built with `sol_attn`
-(bf16, head_dim 128, sm_80+) and otherwise falls back to the existing backend. Eleven
-of the twelve workflows carry it because it is a speed override, not pipeline logic.
+**Sampling defaults (0.104.1).** The generate pass in the examples runs without a turbo
+LoRA: `ModelAttentionBackend` on **comfy kitchen attention**, then `BasicScheduler` beta at
+**10 steps**, with the phase-1 `ClownSampler` at eta 0.2 handing over to `linear/euler`.
+The turbo LoRA loader is still in each graph, **bypassed**. Re-enable it and set the
+scheduler back to 8 steps for the few-step path the examples used before.
 
-The workflows here are on **v3**, the file linked at the bottom of
-[comfy-kitchen PR #117](https://github.com/Comfy-Org/comfy-kitchen/pull/117). It keeps
-the same `node_id` as v2 but the input list changed, so the two files cannot coexist
-and v2's widget values do not carry over positionally — Kijai's own instruction was to
-remake the node. `tau` now lives under a **`selection`** dynamic combo offering
-`adaptive tau` (tau + `tau_profile`) or `top-k (SLA)` (`keep_percent`, the selection
-lightx2v's SLA turbo LoRAs were distilled against). `routed_cap_percent` is gone.
-These graphs ship on `adaptive tau` at the same 1.3 they used before.
+Two examples keep the turbo LoRA on: **Regenerate-2K** and **Upscale**. Their 2K and
+refine passes run only a few steps and are built around it.
 
-**If you do not have it, delete the node** and wire `ModelAttentionBackend` straight
-through to the LoRA loader. Nothing else in the graph depends on it.
+**No example carries Kijai's `SolAttnMiniMax` (Sol-Attn) any more.** It was a speed
+override, not pipeline logic, and leaving it in made every graph report a missing node
+on installs without it. To use it, insert it between `ModelAttentionBackend` and the LoRA
+loader; nothing else in a graph depends on it.
 
 The prompt nodes are easy to swap for your own — see the Note on each canvas.
 
@@ -327,11 +351,38 @@ told anything about it. Nothing is wired into `audio_denoise_mask`: a subject ma
 white somewhere in every frame and carries no temporal intent, so it must not be
 allowed to reach the audio half. Wire a mask there only to freeze or free a **span**.
 
+[`workflows/MMH3_Looping_GuideVideo_StyleTransfer.json`](workflows/) — v2v style transfer
+over a clip of any length, through the sampler's **`guide_video`** (0.105.0). The
+source's frames go straight into `guide_video`, so each chunk is guided by its own span
+of them, on the output's clock; the source's sound rides through `use_input_audio` on
+the Reference node, as in the Masking graph this one is built from. The style image is
+`<Picture 1>`, and the prompt uses the LoRA's `style_transfer:` trigger.
+
+It needs a **guide-latent LoRA**. A full-clip guide does nothing useful on the base
+model, which is trained only for first/last-frame anchors. The graph ships pointing at
+Alisson's `minimax_h3_style_transfer_v1.0_r64.safetensors` on the **ref2va** base, from
+[Alissonerdx/Minimax-H3-ComfyUI](https://huggingface.co/Alissonerdx/Minimax-H3-ComfyUI)
+(strength 1.0; about 0.7 if the style starts changing the motion). Windows are 10 s,
+because a guide roughly doubles each chunk's sequence. `carry` stays `mask`. Built
+from the node's unit tests and Alisson's single-generation settings; it has not yet
+been run end to end here.
+
 [`workflows/MMH3_Outpaint.json`](workflows/) — reframing, not generation: a landscape
 clip is encoded with **MMH3 Streaming Encode**, extended in the latent by **MMH3
 Outpaint Latent**, and **MMH3 Reframe Pads** solves the pad geometry for a 9:16 target.
 **MMH3 Context Windows** carries one sampler pass across the whole clip instead of
 chunking it through the looping sampler.
+
+## Companion packs
+
+**[ComfyUI-HybridWindows](https://github.com/Jalen-Brunson/ComfyUI-HybridWindows)** by
+Jalen Brunson started life as a fork of this pack and grew into its own: a Rolling
+Diffusion take on long H3 generation, with a sequential warm-up per window and then a
+joint finish. People running it report long renders holding up better over many loops,
+with less of the overcooked skin and colour drift that builds up chunk after chunk. It
+also brings keyframes, resume-from-chunk, V2V workflows and latent-upscale flows. It
+builds on this pack's window and conditioning helpers, so install both. Well worth a
+look if your long runs start to cook.
 
 ## Nodes
 
@@ -471,11 +522,8 @@ for any node is in its tooltip.
 
   It costs N text-encodes rather than one, but **inside a single text-encoder load** —
   N forward passes, not N model swaps, which is the thing this node exists to protect.
-  That is true because the work runs in **two passes**: every window's references are
-  VAE-encoded first, then every prompt is text-encoded. Interleaving them made the two
-  models evict each other once per window — measured by ucren on an 8-window run as
-  eight full swaps of a 15 GB text encoder against a 2.7 GB VAE, all of it before the
-  first sampling step. Fixed in 0.98.0; before that this paragraph was wrong.
+  Since 0.98.0 the two encoders are also *grouped*: every window's references are
+  VAE-encoded first, then every prompt is text-encoded, rather than alternating.
   The vision work is partitioned, not duplicated. And at sampling time it is *cheaper*:
   reference tokens are attended at every step, and a window is a fraction of the whole
   reference — measured at **~32%** for a 600-frame reference in four windows.
@@ -586,6 +634,29 @@ for any node is in its tooltip.
   the sampler without loading 20 GB to tokenize an empty string. `count`
   replicates the same conditioning N times; 1 already covers any chunk count,
   since the sampler reuses the last entry.
+
+- **Apply H3 RefMods to Cond Set** — inject a MiniMaxH3Mod bundle into every
+  chunk's conditioning. RefMods are reference images/videos packed into one
+  safetensors, so a likeness or concept reloads without re-encoding. By default
+  mods are inserted BEFORE trailing control blocks, which keeps control schedules'
+  negative indexes valid; `append_last` puts them after, and then those indexes
+  need adjusting. `retention` multiplies every loader row's strength (0 injects
+  nothing). An unwired or all-zero bundle is a passthrough. Mod references carry
+  no `<Picture N>` tag — prompt them by description. Needs the separate
+  [ComfyUI-MiniMaxH3Mod](https://github.com/Saganaki22/ComfyUI-MiniMaxH3Mod) pack
+  for the `mods` input; the node loads without it, but nothing can feed it.
+  See [docs/refmods.md](docs/refmods.md). From JalenBrunson's fork.
+
+- **MMH3 Cond Set From Viggle** — adapt the cond_set from Viggle-Animate
+  Conditioning (H3, Windowed) for the looping sampler. Both packs emit core's
+  `minimax_refs` blocks, so the conditioning is already compatible and only the
+  socket type name differed. Viggle bakes each window's slice of the driving clip
+  into its own cond, so the two schedules must agree: this derives the
+  `chunk_frames`/`overlap_frames` that rebuild Viggle's spans, replans them the
+  way the sampler will, and reports whether the boundaries match. Wire both INT
+  outputs into the sampler. A differing schedule with the SAME chunk count is the
+  dangerous case — the sampler clamps its cond index and would render every chunk
+  against the wrong frames without complaint — so it is called out per chunk.
 
 - **MMH3 Cond Set Strip Text** — drop the prompt from every entry of a cond_set
   while the reference media rides through untouched. For a refine pass whose
@@ -992,6 +1063,32 @@ a choice here — now lives in
   [`docs/looping-sampler.md`](docs/looping-sampler.md) — including what is still
   unmeasured.
 
+  **`guide_video`** (0.105.0) is core's **Add Guide for MiniMax H3**, windowed. Core
+  anchors a guide clip for ONE generation; it cannot follow a clip across chunks, and
+  this node strips any guide arriving on the conditioning, because one upstream guide
+  would anchor every chunk to the source's opening frames. So the source comes in
+  here instead: each chunk takes its own span of it, encodes that span as one clip
+  (cut to 17k+5 frames, as core does) and anchors it at the chunk's frame 0. Every
+  chunk is guided by exactly the frames it renders, on the output's own clock.
+
+  That is what guide-latent LoRAs need: edit and style-transfer LoRAs trained on
+  guide/target pairs, which have no effect through a reference. A **reference** sits
+  on its own clock, so the model uses it as material and motion drifts; a **guide**
+  sits on the target's, so it lines up frame for frame. The base model is trained only
+  for first/last-frame anchors, so a full-clip guide does nothing useful without such
+  a LoRA.
+
+  Frames are centre-cropped to the generation's grid. A source shorter than the clip
+  guides what it covers and leaves the rest unguided; a longer one has its excess
+  ignored; both are reported. Each span is encoded **fresh** rather than sliced from
+  one whole-clip encode, so every guide opens on a real 1-frame token, as a
+  single-generation guide does. A guide roughly **doubles each chunk's sequence**:
+  chunks run slower and may need a smaller `chunk_frames`. Picture only; keep the
+  source's sound with `use_input_audio`. It refuses `carry="keyframe"` and
+  `keyframes`, which would stack a second guide on frames it already guides — use
+  `carry="mask"`. Unit-tested against a stubbed sampler
+  (`tests/test_guide_video.py`); not yet run on a real render.
+
 - **MiniMax H3 Keyframe Planner** — end-anchored keyframe indices for a chained run,
   ported from LTXAVTools' planner. Frame 0 opens, each chunk travels to a keyframe at
   the last frame **it renders**, the final one ends on `-1`. Start-anchoring instead
@@ -1027,11 +1124,25 @@ a choice here — now lives in
   nothing about whether the shots are the right ones in the right order. Each chunk's
   latent is in hand the moment it is written back, and was being thrown away.
 
-  Each finished chunk is decoded and appended, and what you get is an **animated
-  timeline of the piece so far, played at 24 fps** — real time, which is the only
-  setting that says anything about pacing. `frame_stride` is a fidelity dial, not a
-  speed one: at 3 you keep a third of the frames and hold each three times as long, so
-  the clip still runs at real time for a third of the encode.
+  Each finished chunk is decoded and appended, and what you get is a **timeline of
+  the piece so far, played at 24 fps** — real time, which is the only setting that
+  says anything about pacing — with **play/pause, a scrub bar, and its own sound**
+  when `audio_vae` is wired. `frame_stride` is a fidelity dial, not a speed one: at 3
+  you keep a third of the frames and hold each three times as long, so the clip
+  still runs at real time for a third of the encode.
+
+  **`audio_vae`** (optional, since 0.100.0) decodes each finished chunk's audio too.
+  Wire a stock VAE Loader at `minimax_h3_audio_vae_fp32.safetensors` — the full H3
+  audio VAE; there is no tiny variant and none is needed, a chunk of audio decodes in
+  milliseconds and the model stays resident. The decode is core's own
+  `vae_decode_audio`, loudness normalisation included, so the preview sounds the way
+  the render will. The sound is cut to the *kept frames*, not to the latent — the
+  video path decodes a grid-valid prefix of each chunk and holds the last kept frame a
+  whole stride, and the audio covers exactly that span — so picture and sound stay in
+  step at every chunk boundary and under the `max_frames` cap. Sent as mono 16-bit
+  WAV at the VAE's rate (32 kHz → 64 KB/s, 3.8 MB at the 60-second default cap). A
+  decode that fails once leaves the preview silent for the rest of the run rather
+  than failing it. `live_steps` stays video-only.
 
   **One decode per chunk, never sliced.** The temporal grid does not compose
   additively — 7 latents decode to 22 frames and 2 decode to 5 — so tiling a 12-latent
@@ -1043,13 +1154,13 @@ a choice here — now lives in
   scaled down and 47 latents of 1344×768 is ~1.9 GB in fp32.
 
   `max_frames` caps the timeline, dropping the oldest, so a long render keeps a moving
-  window rather than an animation that grows without limit.
+  window rather than a timeline that grows without limit.
 
   **`live_steps`** (off) additionally pushes a still of the chunk being sampled on every
   step, from the `x0` core hands the wrapper as positional arg 5 of the sampler
   callback. Off by default because it replaces the playing timeline with a frozen
   frame, and it stops sending once the timeline exists — otherwise every step would
-  re-encode the whole animation.
+  re-encode the whole timeline.
 
   **`suppress_sampler_preview`** (on) silences ComfyUI's own latent preview for the
   duration of the sample, so the sampler node and this one do not draw the same thing
@@ -1074,7 +1185,26 @@ a choice here — now lives in
   there is one slot per running node. Taking the node's own `unique_id` and sending a
   custom event to a DOM widget is the only way to keep them separable, which is why
   the pack ships `web/js/mmh3_live_preview.js`. The widget is `serialize: false`: it
-  is a view, not state, and saving it would put a base64 JPEG in every workflow file.
+  is a view, not state.
+
+  **Nothing rides the websocket.** The event carries metadata only (`seq`, the
+  sprite grid, fps/stride, whether there is sound, chunk count, labels); the browser
+  fetches the picture from `/mmh3/preview?node_id=<id>&kind=image` and the sound from
+  `kind=audio`, both under the same `seq`. Core's publish loop awaits every connected
+  socket in turn, so a large frame on the socket would hold every client's progress
+  events behind the slowest tab. Over HTTP it is latest-wins: reassigning a `src`
+  aborts the load in flight, so a slow tab falls at most one chunk behind and never
+  queues. (Since 0.99.1; earlier versions sent base64 in the event.) The encode runs
+  on a worker thread with a one-slot, newest-wins queue (0.99.2), so the sampler does
+  not wait for Pillow after each chunk.
+
+  **The picture is a sprite sheet, not an animated file** (0.100.0). An animation
+  cannot be seeked, paused, or kept in step with a sound. The kept frames go into one
+  roughly-square static WebP grid; the widget's canvas draws frame
+  `floor(t × fps / stride)` at whatever `t` the `<audio>` element reports — or a
+  timer, when there is no audio — so picture and sound cannot drift apart, and a
+  static sheet encodes faster than the animation did. Past WebP's 16383-px side limit
+  the tiles shrink to fit rather than the encode failing.
 
   Any error switches the preview off for the run rather than interrupting it.
 

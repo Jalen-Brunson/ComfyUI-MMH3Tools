@@ -9,7 +9,274 @@ Never insert or reorder existing inputs, or saved workflows silently rebind to t
 wrong widgets. A node that has not shipped may still be reordered freely — say so in
 the entry, and migrate any local workflow in the same commit.
 
-## [Unreleased] — 0.99.0
+## [Unreleased] — 0.105.0
+
+### Added
+
+- **MiniMax H3 Looping Sampler: `guide_video`**, a source clip anchored as a GUIDE under
+  every chunk. Core's Add Guide for MiniMax H3 anchors a guide clip for one generation
+  and cannot follow a clip across chunks, and this node strips guides arriving on the
+  conditioning (one upstream guide would pin every chunk to the source's opening
+  frames). Now each chunk cuts its own span of the source, encodes it as one clip (cut
+  to 17k+5 frames, as core does) and anchors it at the chunk's frame 0, so every chunk
+  is guided by the frames it renders, on the output's clock.
+
+  Built for guide-latent LoRAs (edit and style-transfer LoRAs trained on guide/target
+  pairs), which do nothing through a reference. Spans are encoded fresh per chunk, so
+  each guide opens on a real 1-frame token. Shorter or longer sources are reported, not
+  fatal. Refuses `carry="keyframe"` and `keyframes` alongside it (two guides on the same
+  frames), and refuses without `vae` or #15439. With references present it relies on
+  guides anchoring at the target origin, which current core does (checked:
+  `_guide_origin_correct()` is True on v0.34.0-200).
+
+  Appended as the LAST input, so saved graphs keep their widget order. The hidden
+  `prior_av_latent` comment now says to restore that socket AFTER `guide_video`.
+  New `tests/test_guide_video.py` (26 checks, stubbed sampler); not yet run on a real
+  render.
+
+- **`workflows/MMH3_Looping_GuideVideo_StyleTransfer.json`**, the example for it: the
+  Masking graph with the SAM3 matte chain and the source encode removed (with no mask, a
+  full-denoise pass would overwrite the encoded source anyway), the sampler fed the
+  Reference node's latent so the source audio stays pinned, the source frames wired to
+  `guide_video`, ref2va + Alisson's `minimax_h3_style_transfer_v1.0_r64` at 1.0, a
+  `style_transfer:` prompt against a `<Picture 1>` style image, and 10 s windows. A Note
+  on the canvas explains guide versus reference and where the LoRA comes from. Link
+  integrity swept: 26 nodes, 41 links, nothing dangling.
+
+## [Unreleased] — 0.104.1
+
+### Changed
+
+- **The example workflows move to the current sampling recipe.** Nine generate graphs
+  (Cinematic, Monologue, MusicVideo, Masking, I2V ManualPrompt, I2V PromptBuilding,
+  I2V ControlNet, RefVideo Chunked, Outpaint) now run the generate pass without the turbo
+  LoRA: `BasicScheduler` beta at **10 steps** (was 8), phase-1 `ClownSampler` eta **0.2**
+  where it was 0.4 (Cinematic, Monologue, MusicVideo), and `ModelAttentionBackend` on
+  **comfy kitchen attention** (Outpaint was on pytorch attention). The turbo LoRA loader
+  stays in each graph, **bypassed**, so the few-step path is one re-enable and a step
+  count away.
+
+  **Regenerate-2K and Upscale keep the turbo LoRA on.** Their 2K and refine passes run
+  only a few steps and are built around it.
+
+- **`SolAttnMiniMax` removed from all eleven examples that carried it.** It was a speed
+  override rather than pipeline logic, and a graph that names a node the user lacks
+  reports it missing on load, bypassed or not. The MODEL is spliced straight through
+  (`ModelAttentionBackend` into the LoRA loader; in Regenerate-2K, the LoRA loader into
+  the scheduler and guider), so nothing else in a graph moved. README updated to match.
+
+### Fixed
+
+- **`MMH3_Looping_Monologue.json`: two half-registered links repaired.** Links 604
+  (`MMH3ScenePlanPrompt.system_prompt` → `LlamaGenerate.system`) and 605
+  (`MMH3PromptAccumulate.prior_context` → `MMH3ScenePlanPrompt.prev_detailed`) were on
+  their targets and in the link table but missing from their origins' output lists. A run
+  still got them, since the prompt is built from the input side, but the editor did not
+  draw those wires and moving either node could drop them. Every example now passes a
+  link-integrity sweep: each link present on its origin, its target and in the table.
+
+## [Unreleased] — 0.104.0
+
+### Fixed
+
+- **The pack no longer imports torchaudio.** ComfyUI removed it as a dependency in
+  [#16457](https://github.com/Comfy-Org/ComfyUI/pull/16457) (2026-09-21) and
+  reimplemented the one function used here as `comfy.audio.resample`. Two nodes did
+  `import torchaudio` unconditionally — `MMH3ForcedAlign` (`_to_mono_16k`) and
+  `MMH3MusicAnalysis` — so on a clean current ComfyUI, where nothing installs
+  torchaudio any more, both would have raised ImportError at execution. The failure
+  would not have shown up here: other custom nodes still pull torchaudio in, so a
+  machine that has been running a while keeps working while a fresh install does not.
+
+  New `common.resample_audio(wav, orig_sr, new_sr)`: core's resampler first,
+  torchaudio only as a fallback for pre-#16457 cores, so both sides of the removal
+  work and the pack still declares no dependencies of its own. Identical rates are a
+  passthrough.
+
+  The substitution is **numerically free** — core's version is the same
+  bandlimited-sinc algorithm with the same defaults, and is bit-identical to
+  `torchaudio.functional.resample` (max|diff| 0.0) at 44k→16k, 48k→16k and 44k→22k on
+  both 1-D and `[1, T]` inputs.
+
+- `tests/test_resample.py` — covers the passthrough, the bit-identical cross-check
+  against torchaudio, and the **fallback branch**, which is dead code on any core that
+  has `comfy.audio.resample` and so is forced by hiding the attribute.
+
+### Compatibility
+
+- **Verified on ComfyUI `v0.34.0-200-g79be670e` (2026-09-25)** with `comfy-aimdo==0.5.5`,
+  `comfy-kitchen==0.2.35`, frontend 1.53.6, templates 0.11.70, embedded-docs 0.5.12.
+  Suite: 27 pass, the same 2 pre-existing failures.
+- The 102 commits from the previous baseline touched the H3 **VAE** (tile blending, a
+  fused-kernel rewrite, an offloaded-`qk_norm_scale` crash fix) and
+  `MiniMaxH3FunControlPatch`. Nothing touched `samplers.py`, `nested_tensor.py`,
+  `node_helpers.py` or `PackedLayout`, and the `* denoise_mask` line the #15988 probe
+  keys on is byte-identical.
+- Upstream also made `--fast-disk` **auto-enable** on fast NVMe
+  ([#16333](https://github.com/Comfy-Org/ComfyUI/pull/16333)), with a new
+  `--disable-fast-disk` to opt out. Another silently-on default, like the compiler.
+
+## [Unreleased] — 0.103.0
+
+### Added
+
+- **`masked_velocity_is_scaled()`** (`nodes_loop`) — detects ComfyUI
+  [#15988](https://github.com/Comfy-Org/ComfyUI/pull/15988) (merged 2026-09-09), which
+  makes `MiniMaxH3Model.forward` scale masked rows' velocity by the denoise mask.
+  Source-inspected, the same way `_guides_available` detects #15439; `* denoise_mask`
+  appears in `forward` only after the merge.
+
+  It is **reported, never gated on**. This is a core correctness fix, not something
+  the pack requires — but it changes what `carry="mask"` computes, so
+  `MMH3LoopingSampler`'s run summary now ends its carry line with
+  `core scales masked velocity (#15988): yes/no`. Two runs either side of a core
+  update are otherwise indistinguishable in a log, which is the same reason the carry
+  settings are in that summary at all. What #15988 does to output at intermediate
+  `overlap_strength` values has NOT been measured.
+
+- `tests/test_core_probes.py` — asserts all five core-capability probes return a bool
+  rather than raising (each swallows and returns False by contract; an escaping
+  exception would take a node down), and cross-checks the new one against the
+  installed source rather than trusting it.
+
+### Compatibility
+
+- **Verified on ComfyUI `v0.34.0-98-ga7b1d39d` (2026-09-09)** with `comfy-aimdo==0.5.3`
+  and `comfy-kitchen==0.2.33`. Suite: 26 pass, 2 pre-existing failures unchanged
+  across the update (`test_looping_sampler.py`, `test_multiprompt.py`).
+- README now records that core and `comfy-aimdo` cannot move independently — core does
+  a module-level `import comfy_aimdo.malloc_graph`, absent before aimdo 0.5.x — and
+  documents `--disable-comfy-compiler` for `RuntimeError: aimdo memory compile error`,
+  which H3 graphs hit disproportionately because the compiler integration sits inside
+  H3's own forward pass. Neither is a pack issue; nothing here references aimdo.
+
+## [Unreleased] — 0.102.0
+
+### Added
+
+- **Apply H3 RefMods to Cond Set** (`H3RefModCondSetApply`) — cherry-picked from
+  [JalenBrunson's fork](https://github.com/Jalen-Brunson/ComfyUI-MMH3Tools/tree/h3-hybrid-resume),
+  his work, requested in the resource thread. Applies a MiniMaxH3Mod loader bundle
+  to every chunk's conditioning, inserting mod blocks before trailing control
+  references so control schedules' negative indexes stay valid. `retention` scales
+  each loader row's strength; unwired or all-zero is a passthrough.
+
+  Taken WITHOUT the rest of that branch (`MMH3HybridWindowSampler`,
+  `MMH3JointWindowSampler`, the resume nodes). The refmods commit is the branch
+  tip and sits on top of those, so the cherry-pick conflicted on `__init__.py` and
+  `README.md`; resolved to keep only the refmods import and paragraph.
+  `nodes_refmods.py` needs nothing from that work beyond `MMH3CondSet`.
+
+  The `mods` socket is typed `H3_REF_MODS` and duck-types `mod.ref_block()` with
+  no hard import, so the node loads with or without
+  [ComfyUI-MiniMaxH3Mod](https://github.com/Saganaki22/ComfyUI-MiniMaxH3Mod)
+  installed — but that pack is what feeds the input, and it is not installed here.
+
+  Its `node_id` is `H3RefModCondSetApply`, not `MMH3...`. Kept as-is so workflows
+  built against his branch keep loading; it is the second node id in the pack that
+  breaks the prefix, after `WhisperAlignmentToText`.
+
+## [Unreleased] — 0.101.0
+
+### Added
+
+- **MMH3 Cond Set From Viggle** — interop with
+  [ComfyUI-Viggle-Animate-H3](https://github.com/Saganaki22/ComfyUI-Viggle-Animate-H3).
+  Its windowed conditioning node and this pack's looping sampler independently
+  arrived at the same design — a cond_set of one conditioning per chunk, the
+  guider's positive replaced per chunk — and its reference blocks are the same
+  schema as ours, since both emit core's H3 `minimax_refs`. So the conditioning
+  needs no translation; the only thing blocking the wire was the socket type
+  name (`VIGGLE_COND_SET` vs `MMH3_COND_SET`).
+
+  The node does more than retype, because the spans are the real hazard. Viggle
+  bakes a per-window slice of the driving clip into each cond, so cond *i* is
+  correct only for *its* span. The sampler plans its own spans from
+  `chunk_frames`/`overlap_frames` and reads `conds[min(i, len(conds) - 1)]` — so
+  a schedule that differs but has the same chunk COUNT slips past the sampler's
+  only guard and conditions every chunk on the wrong frames, silently. This node
+  therefore derives the `chunk_frames`/`overlap_frames` that reproduce Viggle's
+  schedule, replans them through the sampler's own `_plan`, and reports whether
+  the spans come back identical. Wire the two INT outputs into the sampler and
+  the alignment is structural rather than remembered. A mismatch is reported per
+  chunk and logged, not raised.
+
+  Not yet tested against a live Viggle render: the compatibility is established
+  by matching block schemas and a span round-trip in `tests/test_viggle.py`, not
+  by a completed generation.
+
+## [Unreleased] — 0.100.0
+
+### Added
+
+- **MMH3 Timeline Preview plays its sound.** New optional `audio_vae` input,
+  appended after `vae` (append-only). Wire a stock VAE Loader at the full H3
+  audio VAE (`minimax_h3_audio_vae_fp32.safetensors`); each finished chunk's
+  audio latent — which the looping sampler already had in hand next to the
+  video, in VAE space — is decoded through core's own `vae_decode_audio`
+  (loudness normalisation included) and appended to a mono waveform kept in
+  lock-step with the frames: its length is always
+  `round(frames × stride × sr / fps)` samples, so the two agree at every chunk
+  boundary and under the `max_frames` cap. Served as 16-bit mono WAV from the
+  preview route with `kind=audio`, under the same `seq` as the picture. A decode
+  that fails once leaves the preview silent for the rest of the run. Without
+  the input, nothing changes except the player below. `live_steps` stays
+  video-only (the per-step `x0` is sampler-space and would need the
+  `audio_scale` division; not done).
+
+### Changed
+
+- **The preview widget is a player, not an `<img>`.** The picture is now a
+  static WebP **sprite sheet** of the kept frames rather than an animated WebP —
+  an animation cannot be seeked, paused, or kept in step with a sound. The
+  widget's canvas draws frame `floor(t × fps / stride)` at whatever `t` the
+  `<audio>` element reports, or a wall timer when there is no audio, so picture
+  and sound cannot drift. Play/pause, a scrub bar, and a mute button (shown
+  only when there is sound). The timeline starts on its own when the first chunk
+  lands; if the browser refuses sound without a click, the ▶ button is that
+  click. A static sheet also encodes faster than the animation did. Tiles shrink
+  to fit when a sheet would pass WebP's 16383-px side limit. Route gains a
+  `kind=image|audio` parameter (default `image`). Event payload: `image`
+  dimensions plus `sprite {cols, rows, tw, th, count}`, `fps`, `stride`,
+  `audio`, `sr`. The ideas — sprite + audio clock, sound in a live preview at
+  all — owe to drozbay's ComfyUI-PreviewRelay; reimplemented, no code copied.
+- `PreviewSession.chunk()` takes an optional fifth argument, the chunk's audio
+  latent; MMH3 Looping Sampler passes it.
+
+## 0.99.2
+
+### Changed
+
+- **MMH3 Timeline Preview encodes off the sampler thread.** An animated WebP is
+  one file, so every finished chunk re-encoded the whole timeline so far on the
+  thread that was about to start the next chunk — hundreds of ms of idle GPU per
+  chunk at `max_frames`, more with `live_steps` firing per step. `_send` now
+  snapshots the frames and hands them to a module-level daemon worker through a
+  one-slot queue; the newest job evicts a stale pending one rather than waiting,
+  so a slow encode leaves the preview at most one chunk behind and never builds
+  a backlog. Latest-wins on this end matches the browser end from 0.99.1. An
+  encode failure logs and drops that frame instead of disabling the session,
+  because the sampler can no longer see the exception. The decode stays on the
+  sampler thread — it needs the GPU and the latent. No inputs changed.
+
+## 0.99.1
+
+### Fixed
+
+- **MMH3 Timeline Preview no longer sends the image over the websocket.** The
+  event was carrying the whole frame as base64 — an animated WebP timeline is
+  hundreds of KB, base64 makes it a third bigger — and core's publish loop awaits
+  every connected socket in turn, so one slow tab held every client's progress
+  events behind the frame. The event is now metadata only (`seq`, `mime`, `w`,
+  `h`, chunks, labels) and the browser fetches the bytes from a new route,
+  `GET /mmh3/preview?node_id=<id>`, which serves whatever that node last drew.
+  Latest-wins by construction: reassigning the `<img>` aborts any load still in
+  flight, so a slow tab falls at most one frame behind and never builds a queue.
+  The pattern is the one drozbay's ComfyUI-PreviewRelay uses; reimplemented, no
+  code copied. No inputs changed. The WebP encode still runs on the sampler
+  thread — moving it off is a separate change.
+
+## 0.99.0
 
 ### Changed
 
@@ -47,29 +314,54 @@ the entry, and migrate any local workflow in the same commit.
 
 ## [Unreleased] — 0.98.0
 
-### Fixed
+### Changed
 
-- **Windowed references thrashed the VAE and the text encoder against each other.**
-  The cond loop built a window's references (VAE) and then encoded that window's prompt
-  (text encoder), per window — so the two models evicted each other every iteration.
-  ucren's log on an 8-window run shows it plainly: eight `MiniMaxH3VideoVAE` stages
-  interleaved with eight `MiniMaxH3TEModel_` stages, 2.7 GB against 15 GB, all before a
-  single sampling step.
+- **Windowed references now VAE-encode in one pass, then text-encode in one pass.**
+  The cond loop used to build a window's references (VAE) and then encode that window's
+  prompt (text encoder), alternating per window. The work is now grouped: every window's
+  references are encoded first, then every prompt. Verified by call ordering — every VAE
+  call precedes every text encode.
 
-  The work now runs in **two passes**: every window's references are encoded first with
-  the VAE resident, then every prompt is encoded with the text encoder resident. One
-  load of each instead of N of both. Verified by call ordering — every VAE call precedes
-  every text encode.
+  Cost: N windows' reference latents are held at once rather than one at a time. The
+  reference blocks were already being retained per cond anyway.
 
-  **The README claimed this was already true** — "inside a single text-encoder load,
-  N forward passes, not N model swaps". It was not. The claim is now accurate and the
-  README says which version made it so.
+  Prompted by ucren, 2026-09-01.
 
-  Cost: N windows' reference latents are held at once rather than one at a time. Small
-  against a 15 GB model swap, and the reference blocks were already being retained per
-  cond anyway.
+### Correction
 
-  Reported by ucren, 2026-09-01.
+- **This entry originally claimed the old order "thrashed" the two models, and that is
+  not supported by the evidence.** The reasoning was that ucren's 8-window log showed
+  eight `MiniMaxH3VideoVAE` stages interleaved with eight `MiniMaxH3TEModel_` stages,
+  and that this meant eight full swaps of a 15 GB encoder against a 2.7 GB VAE. It does
+  not. The two log lines mean different things:
+
+  - `Requested to load X` (`comfy/model_management.py:952`) prints only when the model
+    is **not** already in `current_loaded_models`. One line is one real load.
+  - `Model X prepared for dynamic VRAM loading` (`comfy/model_patcher.py:2026`) fires on
+    every `load_models_gpu` call, resident or not. On an already-resident model that
+    pass re-casts the force-preloaded params and the named buffers — the 692 KB / 4572 KB
+    the line itself reports — keeps the existing vbar slots, and calls `prioritize()`.
+    The bulk of the weights live in aimdo's vbar and are not touched by it.
+
+  Counted against the original attachment: `Requested to load` appears **once**, with
+  eight VAE stages, eight TE stages and zero unloads. The post-change log has the same
+  shape with four of each. One load of each model, before and after. `free_memory` also
+  declines to unload a dynamic model on behalf of another dynamic model — "that works
+  on-demand."
+
+  What cannot be ruled out from a log is page-level eviction inside the vbar. That
+  happens per-op at `comfy/ops.py:166` via `vbar_fault`, is signature-checked, and
+  **emits no line at any log level**. VAE 2.7 GB + TE 15 GB is ~18 GB before
+  activations, so under VRAM pressure the grouping could genuinely reduce fault traffic.
+  That is the only mechanism under which this change saves real time, and it is
+  unmeasured — the reporter's GPU is unknown, and their before/after runs used different
+  window counts (8 x 106 frames vs 4 x 174).
+
+  The dominant cost in that run was the eight VAE encodes themselves (`0 encodes
+  reused`), which this change does not reduce.
+
+  The README paragraph corrected alongside the original entry was **right as written**
+  and has been restored.
 
 ## [Unreleased] — 0.97.2
 
