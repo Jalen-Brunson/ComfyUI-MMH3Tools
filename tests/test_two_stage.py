@@ -112,6 +112,7 @@ class SpySampler(LS.SamplerCustomAdvanced):
     def sample(self, noise, guider, sampler, sigmas, latent_image):
         SAMPLES.append({"tag": guider.model_patcher.model.tag, "sigmas": sigmas.clone(),
                         "latent": latent_image, "noise": noise,
+                        "positive": (getattr(guider, "original_conds", {}) or {}).get("positive"),
                         "opts": dict((getattr(guider, "model_options", {}) or {}).get("transformer_options", {}))})
         return super().sample(noise, guider, sampler, sigmas, latent_image)
 
@@ -356,6 +357,62 @@ b = run(overlap_pin="full", context_frames=5, accepted_prefix_frames=0, stage2_g
 check("unused stage-2 inputs change nothing", torch.equal(vid(a[0]), vid(b[0])) and torch.equal(aud(a[0]), aud(b[0])))
 check("one sample per chunk, main model only", [s["tag"] for s in SAMPLES] == ["A"] * 3)
 check("no tap span without tail_custom", all("h3_tap_context_rows" not in s["opts"] for s in SAMPLES))
+
+print("\n10. guide_video in both stages")
+
+
+class GuideVAE:
+    """Encodes a frame batch to its mean, so a guide's value names the frames it holds."""
+    def __init__(self):
+        self.seen = []
+
+    def encode(self, image):
+        self.seen.append(tuple(image.shape))
+        from comfy_extras.nodes_minimax_h3 import video_latent_t
+        t = 1 if len(image) == 1 else video_latent_t(len(image))
+        return torch.full((1, 24, t, image.shape[1] // 16, image.shape[2] // 16), float(image.mean()))
+
+
+def frame_ramp(count=FRAMES):
+    return (torch.arange(count, dtype=torch.float32) / 255)[:, None, None, None].expand(-1, 32, 32, 3)
+
+
+def kf_of(sample):
+    # core's convert_cond stores each entry as one flat dict
+    return [kf for d in sample["positive"] for kf in d.get("minimax_keyframes", [])]
+
+
+gv = GuideVAE()
+res = run(sigmas=SIG[:5], stage2_sigmas=torch.tensor([.6, .3, 0.0]), stage2_guider=gb,
+          upscale_model="stub.safetensors", upscale_megapixels=MP_HI, guide_video=frame_ramp(), vae=gv)
+st1 = [s for s in SAMPLES if s["tag"] == "A"]
+st2 = [s for s in SAMPLES if s["tag"] == "B"]
+spans = [(0, 73), (34, 107), (68, 141)]
+check("stage 1: one guide per chunk on the 2x2 grid",
+      all(len(kf_of(s)) == 1 and tuple(kf_of(s)[0]["latent"].shape[-3:]) == (22, 2, 2) for s in st1))
+check("stage 2: the same span re-encoded on the 4x4 grid",
+      all(len(kf_of(s)) == 1 and tuple(kf_of(s)[0]["latent"].shape[-3:]) == (22, 4, 4) for s in st2))
+check("both stages' guides hold their chunk's own frames",
+      all(abs(float(kf_of(s)[0]["latent"].mean()) - (f0 + f1 - 1) / 2 / 255) < 1e-5
+          for st in (st1, st2) for s, (f0, f1) in zip(st, spans)))
+check("the VAE saw 32 px and 64 px frames", {sh[1] for sh in gv.seen} == {32, 64}, sorted(set(gv.seen)))
+gv = GuideVAE()
+run(sigmas=SIG[:5], stage2_sigmas=SIG[4:], guide_video=frame_ramp(), vae=gv)
+check("one grid: stage 2 reuses the stage-1 guide (no second encode)", len(gv.seen) == 3, len(gv.seen))
+check("one grid: stage 2 carries the guide too",
+      all(len(kf_of(s)) == 1 for s in SAMPLES if s["sigmas"][0] <= .5 + 1e-6))
+
+print("\n11. stage2_latent never pins v2v keeps")
+lat = master(value=0.5)
+keep = torch.ones([1, 1, 42, 2, 2])
+keep[:, :, :, :, :1] = 0.0
+lat["noise_mask"] = NestedTensor([keep, torch.ones([1, 1, 2, aud(lat).shape[-1]])])
+blank = master(value=0.0)
+blank["samples"] = NestedTensor([torch.zeros([1, 24, 42, 4, 4]), aud(blank)])
+res = run(latent=lat, sigmas=SIG[:5], stage2_sigmas=torch.tensor([.6, .3, 0.0]), stage2_guider=gb,
+          upscale_model="stub.safetensors", upscale_megapixels=MP_HI, stage2_latent=blank)
+check("keep regions come from the upscaled source, not a zero stage2_latent",
+      torch.allclose(vid(res[0])[:, :, :, :, :2], torch.full_like(vid(res[0])[:, :, :, :, :2], 0.5)))
 
 print("\nFAILURES: %s" % fails if fails else "\nall passed")
 sys.exit(1 if fails else 0)

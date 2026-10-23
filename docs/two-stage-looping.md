@@ -77,8 +77,14 @@ measured as a corrupted high-res finish.
 **Audio** is never resized. It keeps stage 1's noise.
 
 **Masks.** The master's pins are resized nearest-exact onto the new grid. Rows the master
-pins (v2v keeps) take `stage2_latent`'s exact source when it is wired; otherwise they are
-the upscaled source.
+pins (v2v keeps) come back from stage 1 as the source itself, so stage 2 receives them
+upscaled. `stage2_latent` is never used for them: a resume master built without the
+source holds zeros there, which would pin black.
+
+**Guides.** `guide_video` (0.105.0) is encoded per chunk on each stage's grid. Stage 1
+gets the chunk's span at the master's size. Stage 2 gets the same span encoded again at
+the upscaled size, because a guide's rows have to share the grid being sampled. On one
+grid, stage 2 reuses stage 1's guide.
 
 **Stage-1 carry** (`stage1_carry`):
 
@@ -92,7 +98,9 @@ the upscaled source.
 
 **Resume and accepted frames on two grids:**
 
-- Wire the previous run's final master, on the stage-2 grid, to `stage2_latent`.
+- Wire the previous run's final master, on the stage-2 grid and cut to this run's span,
+  to `stage2_latent`. For example, run the saved high-res master through an
+  H3 Continue Master with the same resume settings as the stage-1 master.
 - A chunk that carries rows this run did not render stops with an error instead of
   upscaling a guess in their place.
 - `latent` is the stage-1 grid master. To keep `stage1_carry = estimate`, resume it from

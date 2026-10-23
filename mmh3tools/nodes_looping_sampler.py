@@ -794,11 +794,13 @@ class MMH3LoopingSampler(io.ComfyNode):
                             "= its finished stage-2 rows, area-downscaled."),
                 io.Latent.Input(
                     "stage2_latent", optional=True,
-                    tooltip="With an upscaler: the master on the stage-2 grid. Required when a "
-                            "chunk carries rows this run does not render (resume, accepted "
-                            "frames): the previous finished chunks come from here. Rows the "
-                            "master pins (v2v keep regions) take its exact high-res source; "
-                            "unwired, they are upscaled from stage 1. Its audio is not used."),
+                    tooltip="With an upscaler: the master on the stage-2 grid (same length as "
+                            "`latent`, e.g. an H3 Continue Master built from the saved "
+                            "high-res master). Required when a chunk carries rows this run does "
+                            "not render (resume, accepted frames): those finished rows come "
+                            "from here, and rows no chunk rewrites keep its content. Rows the "
+                            "master pins inside rendered chunks (v2v keeps) always come from the "
+                            "upscaled stage-1 rows. Its audio is not used."),
             ],
             outputs=[
                 io.Latent.Output(display_name="latent"),
@@ -1222,8 +1224,8 @@ class MMH3LoopingSampler(io.ComfyNode):
                            hi_size[0] * VAE_SPATIAL))
                 fin_v = s2_v.to(device=master_v.device, dtype=master_v.dtype).clone()
                 hi_valid = torch.ones(total_t, dtype=torch.bool)
-                lines.append("  stage2_latent: previous chunks and pinned source rows on "
-                             "the stage-2 grid come from it")
+                lines.append("  stage2_latent: rows this run does not render (resume, accepted "
+                             "frames) come from it on the stage-2 grid")
             else:
                 fin_v = torch.zeros(list(master_v.shape[:3]) + list(hi_size),
                                     dtype=master_v.dtype, device=master_v.device)
@@ -1472,6 +1474,7 @@ class MMH3LoopingSampler(io.ComfyNode):
             # clip is built for a single generation and so what guide LoRAs trained on.
             # Windows start on phase 0, so the span is a valid 17k+5-frame clip.
             gv_note = ""
+            guides2 = list(guides_hi.get(i, []))
             if guide_video is not None:
                 f0 = frame_at_latent(v0)
                 want_f = frame_at_latent(v1) - f0
@@ -1483,6 +1486,13 @@ class MMH3LoopingSampler(io.ComfyNode):
                     gv_note = ", guide frames %d-%d%s%s" % (
                         f0, f0 + gf - 1, "" if gf == want_f else " (short: %d of %d)"
                         % (gf, want_f), "" if not fit else ", resized " + fit)
+                    if two_grid:
+                        # FORK: stage 2 samples on the upscaled grid, and a guide's rows
+                        # share the grid it samples -- the same span, encoded again there
+                        px2, _fit2 = _fit_keyframe(guide_video[f0:f0 + gf],
+                                                   hi_size[1] * VAE_SPATIAL,
+                                                   hi_size[0] * VAE_SPATIAL, is_opener=False)
+                        guides2.append({"resolved_frame_index": 0, "latent": vae.encode(px2)})
                 else:
                     gv_note = ", no guide (the guide video ended)"
 
@@ -1494,12 +1504,11 @@ class MMH3LoopingSampler(io.ComfyNode):
                         "of the target origin. See docs/core-changes.md." % i)
                 chunk_cond = node_helpers.conditioning_set_values(
                     chunk_cond, {"minimax_keyframes": chunk_guides})
-            # stage 2 on another grid takes the same keyframes encoded for that grid
+            # stage 2 on another grid takes the same keyframes and guide encoded for it
             cond2 = chunk_cond
             if two_grid:
                 cond2 = (node_helpers.conditioning_set_values(
-                    base_cond, {"minimax_keyframes": guides_hi[i]}) if guides_hi.get(i)
-                    else base_cond)
+                    base_cond, {"minimax_keyframes": guides2}) if guides2 else base_cond)
 
             # frame_at_latent, NOT latents_to_frames: v0 is an arbitrary window
             # bound, and latents_to_frames is only meaningful on the 5j+2 grid --
@@ -1544,11 +1553,10 @@ class MMH3LoopingSampler(io.ComfyNode):
                     lat_v = TS.upscale_video(
                         x_v, upscale_model, float(upscale_megapixels), upscale_precision,
                         upscale_temporal_chunking, keep_upscaler_loaded).to(x_v.dtype)
-                    if stage2_latent is not None and in_mask2_v is not None:
-                        # rows the master pins take stage2_latent's exact source
-                        m = in_mask2_v[:, :, v0:v1].to(device=lat_v.device, dtype=torch.float32)
-                        src = fin_v[:, :, v0:v1].to(device=lat_v.device, dtype=torch.float32)
-                        lat_v = (src + (lat_v.float() - src) * m).to(x_v.dtype)
+                    # Rows the master pins (v2v keeps) come back from stage 1 as the source
+                    # itself, so the upscale above already carries them. stage2_latent is NOT
+                    # used for them: a resume master built without the source holds zeros
+                    # there, which would pin black.
                 else:
                     lat_v = x_v.clone()
                 if carried:
