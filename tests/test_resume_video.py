@@ -13,7 +13,9 @@ sys.argv = [sys.argv[0], '--cpu']
 import comfy.options
 comfy.options.enable_args_parsing()
 import server
-server.PromptServer.instance = SimpleNamespace(prompt_queue=None)
+# routes: nodes_preview registers its /mmh3/preview media route at import (0.99.1+)
+from aiohttp import web
+server.PromptServer.instance = SimpleNamespace(prompt_queue=None, routes=web.RouteTableDef())
 import av
 import torch
 from videohelpersuite import utils as vhs
