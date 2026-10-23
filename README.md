@@ -3,6 +3,9 @@
 MiniMax H3 latent tooling for ComfyUI — latent-domain conditioning and correct AV
 splicing for **chained long-form generation**.
 
+[Apply H3 RefMods to Cond Set](docs/refmods.md) injects a MiniMaxH3Mod bundle into
+every chunk's conditioning while keeping trailing control references in place.
+
 ## What has actually been run
 
 **`carry="mask"` is the tested path.** Every example workflow ships with it, and every
@@ -1594,3 +1597,7 @@ per chunk, a section spliced into the wrong format. None of that raises; it rend
 and looks slightly bad. The tests are the record of which of those have been pinned
 down, and several encode a bug that actually shipped. Read them as the honest version
 of the claims above.
+
+### Hybrid sampler location
+
+`MMH3HybridWindowSampler` now lives in [ComfyUI-HybridWindows](https://github.com/Jalen-Brunson/ComfyUI-HybridWindows). Install/update that pack and restart to use existing hybrid workflows. The node ID and inputs are preserved. MMH3Tools continues to supply its shared window, conditioning and mask helpers.

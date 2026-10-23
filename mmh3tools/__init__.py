@@ -16,6 +16,10 @@ from .nodes_lint import MMH3PromptLint
 from .nodes_music import (MMH3LyricsSectionize, MMH3MusicCaptionSplit,
                           MMH3MusicCaptionSystemPrompt)
 from .nodes_looping_sampler import MMH3KeyframePlanner, MMH3LoopingSampler
+from .nodes_joint_sampler import MMH3JointWindowSampler
+from .nodes_resume import MMH3LoadResumeRun, MMH3SaveResumeVideo, MMH3ResumePlan, MMH3ResumeJoinAV
+from .nodes_media import MMH3AudioRange, MMH3ResumeVideo
+from .nodes_refmods import H3RefModCondSetApply
 from .nodes_save import MMH3SizeCappedCopy, MMH3StreamingSave
 from .nodes_upscale import MMH3ChunkedPixelUpscale
 from .nodes_tokens import MMH3OfficialTokens
@@ -77,6 +81,13 @@ NODES = [
     MMH3FrameCalculator,
     # MMH3Tools/sampling
     MMH3LoopingSampler,
+    MMH3JointWindowSampler,
+    MMH3LoadResumeRun,
+    MMH3SaveResumeVideo,
+    MMH3ResumePlan,
+    MMH3ResumeJoinAV,
+    MMH3AudioRange,
+    MMH3ResumeVideo,
     MMH3ContextWindows,
     # MMH3Tools/calculators
     MMH3ChunkSchedule,
@@ -110,6 +121,7 @@ NODES = [
     MMH3MusicCaptionSplit,
     MMH3LyricsSectionize,
     # MMH3Tools/conditioning
+    H3RefModCondSetApply,
     MMH3ReferenceMultiPrompt,
     MMH3Regenerate2KReference,
     MMH3CondSelect,
@@ -148,8 +160,6 @@ NODES = [
 ]
 
 __all__ = ["NODES"]
-
-
 
 
 
