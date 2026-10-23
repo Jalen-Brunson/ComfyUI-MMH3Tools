@@ -20,6 +20,7 @@ cached prefix. Cheap for still images; the thing to avoid for video references.
 import hashlib
 import logging
 import math
+import re
 
 import torch
 
@@ -38,6 +39,7 @@ from comfy_extras.nodes_minimax_h3 import (
 )
 
 from .common import evict_text_encoder
+from .reference_cache import ReferenceCache, model_key
 from .nodes_windows import _plan, _window_frame_spans
 
 MMH3CondSet = io.Custom("MMH3_COND_SET")
@@ -46,58 +48,6 @@ MMH3CondSet = io.Custom("MMH3_COND_SET")
 # whole node, so without this a one-word change costs every prompt's Qwen pass.
 _CACHE = {}
 _CACHE_MAX = 64
-
-
-def _hash_tensor(h, t):
-    """Strided sample of a tensor into a hash. O(4096) regardless of size."""
-    h.update(str(tuple(t.shape)).encode())
-    flat = t.detach().flatten()
-    step = max(1, flat.numel() // 4096)
-    h.update(flat[::step].to(torch.float32).cpu().numpy().tobytes())
-
-
-def _hash_input(h, obj):
-    """Hash a raw reference input: IMAGE tensor, or AUDIO {waveform, sample_rate}."""
-    if obj is None:
-        h.update(b"none")
-    elif isinstance(obj, dict) and "waveform" in obj:
-        h.update(str(obj.get("sample_rate")).encode())
-        _hash_tensor(h, obj["waveform"])
-    elif isinstance(obj, (list, tuple)):
-        # a reference LIST: hash each entry, since repr() of a tensor list is
-        # truncated and two different sets can share one
-        h.update(b"list:%d" % len(obj))
-        for item in obj:
-            _hash_input(h, item)
-    elif hasattr(obj, "shape"):
-        _hash_tensor(h, obj)
-    else:
-        h.update(repr(obj).encode())
-
-
-def _fingerprint(ref_blocks, raw_inputs, width, height, length, ref_image_size):
-    """Identify a reference set cheaply but honestly.
-
-    Hashes BOTH the raw inputs and the encoded blocks. The blocks alone would be
-    tempting -- they are already in hand and capture every sizing decision -- but
-    that makes cache validity depend on the VAE mapping different references to
-    different latents. That holds for a real VAE and is exactly the assumption you
-    do not want load-bearing when the failure mode is a stale encode with no
-    visible symptom: the wrong reference, silently, in every chunk. Hashing the
-    inputs costs a strided read of a few images and removes the assumption.
-    """
-    h = hashlib.sha256()
-    h.update(("%d|%d|%d|%s" % (width, height, length, ref_image_size)).encode())
-    for obj in raw_inputs:
-        _hash_input(h, obj)
-    for b in ref_blocks:
-        h.update(("%s|%s|%s|%s|%s" % (b.get("kind"), b.get("latent_h"), b.get("latent_w"),
-                                      b.get("latent_t"), b.get("ref_audio_t"))).encode())
-        for key in ("latent", "audio_latent"):
-            t = b.get(key)
-            if t is not None:
-                _hash_tensor(h, t)
-    return h.hexdigest()
 
 
 def _embedding_rows(name):
@@ -209,7 +159,7 @@ def _window_media(frames, soundtrack, span, fps=FPS):
     return out_frames, out_audio
 
 
-def _window_preview(ref_videos, windows):
+def _window_preview(ref_videos, windows, skip=()):
     """First and last frame of every reference window, so the spans can be SEEN.
 
     The log already prints the spans as numbers, which is enough to check the
@@ -221,7 +171,8 @@ def _window_preview(ref_videos, windows):
     a diagnostic, not a reference, and resampling it would hide exactly the kind of
     off-by-a-window error it exists to catch.
     """
-    vids = [v for v in (ref_videos or {}).values() if v is not None]
+    vids = [v for k, v in (ref_videos or {}).items()
+            if v is not None and k not in (skip or ())]
     if not vids or not windows:
         return torch.zeros((1, 64, 64, 3))
     src = vids[0]
@@ -250,9 +201,37 @@ def _ref_windows(total_frames, chunk_frames, overlap_frames):
     return _window_frame_spans(windows, total_f)
 
 
+def _parse_static_ref_videos(text, ref_videos):
+    """`static_ref_videos` widget -> set of socket names that are NOT windowed.
+
+    Accepts the socket name as shown on the node (`ref_video_2`) or the bare
+    socket index (`2`, 0-based -- the same N). Comma/space/semicolon separated.
+    Anything else is rejected rather than guessed: a typo here would either
+    window a likeness clip to nothing or ride a whole control video through
+    every chunk, and neither shows up as anything but a bad render.
+    """
+    out = set()
+    for tok in re.split(r"[,\s;]+", (text or "").strip()):
+        if not tok:
+            continue
+        m = re.fullmatch(r"(?:ref_video_)?(\d+)", tok.strip().lower())
+        if not m:
+            raise ValueError(
+                "MMH3ReferenceMultiPrompt: `static_ref_videos` entry %r is not a "
+                "socket -- use the socket name as shown on the node (ref_video_2) "
+                "or its index (2)." % (tok,))
+        name = "ref_video_%d" % int(m.group(1))
+        if ref_videos is not None and name not in ref_videos:
+            logging.warning("[MMH3ReferenceMultiPrompt] static_ref_videos names %s, "
+                            "which is not a socket on this node -- ignored", name)
+            continue
+        out.add(name)
+    return out
+
+
 def _build_refs(vae, audio_vae, width, height, frame_count, ref_image_size,
                 ref_images, ref_videos, ref_video_audios, ref_audios,
-                ref_window=None):
+                ref_window=None, static_videos=None):
     """Reference items (for the tokenizer) and blocks (for the DiT), built once.
 
     DUPLICATED FROM comfy_extras/nodes_minimax_h3.py, deliberately: upstream runs
@@ -326,11 +305,24 @@ def _build_refs(vae, audio_vae, width, height, frame_count, ref_image_size,
         if video_frames is None:
             continue
         soundtrack = ref_video_audios.get("ref_video_audio_" + name.rsplit("_", 1)[-1])
-        if ref_window is not None:
+        # A STATIC clip (a short likeness reference: the subject IS the person in
+        # it) rides WHOLE in every window; only windowed controls are cut to the
+        # chunk span. Without this a 5 s clip next to windowed controls is sliced
+        # to nothing from chunk 2 on and errors with 'at least 5 frames'.
+        is_static = bool(static_videos) and name in static_videos
+        if ref_window is not None and not is_static:
             # cut BEFORE the resize and the encode: windowing after would pay the
             # full reference's VAE and vision cost to then throw most of it away
             video_frames, soundtrack = _window_media(video_frames, soundtrack,
                                                      ref_window)
+            n_in = 0 if video_frames is None else int(video_frames.shape[0])
+            if n_in < 5:
+                raise ValueError(
+                    "MMH3ReferenceMultiPrompt: %s has %d frame(s) inside the chunk window "
+                    "%d-%d. A reference shorter than the sequence (a likeness clip) must "
+                    "be listed in `static_ref_videos` so it rides whole in every chunk; "
+                    "only controls that span the run can be windowed."
+                    % (name, n_in, ref_window[0], ref_window[1]))
         vh, vw = video_frames.shape[1], video_frames.shape[2]
         cw, ch = adapt_canvas(vw, vh)
         if vw * vh < cw * ch:
@@ -339,8 +331,11 @@ def _build_refs(vae, audio_vae, width, height, frame_count, ref_image_size,
         frames = _resize(video_frames, cw, ch, "disabled")
         # What this reference is supposed to cover: its own window when windowing,
         # otherwise the whole clip.
-        target = int(frame_count) if ref_window is None else (
-            ref_window[1] - ref_window[0] + 1)
+        if is_static:
+            target = 0  # a static clip is not meant to cover the span
+        else:
+            target = int(frame_count) if ref_window is None else (
+                ref_window[1] - ref_window[0] + 1)
         if frames.shape[0] > frame_count:
             frames = frames[:frame_count]
         n = frames.shape[0]
@@ -401,6 +396,42 @@ def _build_refs(vae, audio_vae, width, height, frame_count, ref_image_size,
                            "audio_latent": audio_latent})
 
     return ref_items, ref_blocks
+
+
+def _cached_refs(cache, vae, audio_vae, width, height, frame_count, ref_image_size,
+                 ref_images, ref_videos, ref_video_audios, ref_audios,
+                 ref_window=None, static_videos=None):
+    """Cache each reference separately so static media survives window/prompt edits."""
+    items, blocks = [], []
+    fingerprint = hashlib.sha256()
+    groups = []
+    if ref_images is not None:
+        groups.append((ref_images, None, None, None, ref_images, None, None))
+    for name, frames in (ref_videos or {}).items():
+        if frames is None:
+            continue
+        audio_name = 'ref_video_audio_' + name.rsplit('_', 1)[-1]
+        audio = (ref_video_audios or {}).get(audio_name)
+        effective = (frames, audio)
+        if ref_window is not None and name not in (static_videos or ()):
+            effective = _window_media(frames, audio, ref_window)
+        groups.append((None, {name: frames}, {audio_name: audio}, None,
+                       effective, frame_count, name in (static_videos or ())))
+    for name, audio in (ref_audios or {}).items():
+        if audio is not None:
+            groups.append((None, None, None, {name: audio}, audio, None, None))
+    for images, videos, video_audios, audios, media, count, static in groups:
+        identity = (model_key(vae), model_key(audio_vae), width, height,
+                    ref_image_size, count, static, bool(images is not None), bool(videos), media)
+        result = cache.get(identity, lambda: _build_refs(
+            vae, audio_vae, width, height, frame_count, ref_image_size,
+            images, videos, video_audios, audios,
+            ref_window=ref_window, static_videos=static_videos), vae, audio_vae)
+        fingerprint.update(cache.last_key.encode())
+        items.extend(result[0])
+        blocks.extend(result[1])
+    cache.fingerprint = fingerprint.hexdigest()
+    return items, blocks
 
 
 AUDIO_LATENT_HZ = 40
@@ -649,6 +680,22 @@ class MMH3ReferenceMultiPrompt(io.ComfyNode):
                             "(#15808, merged 2026-08-22). On an older one the marker "
                             "tokenizes as ordinary words and nothing is spliced, so "
                             "this refuses rather than pretending."),
+                io.String.Input(
+                    "static_ref_videos", default="", optional=True,
+                    tooltip="Reference-video SOCKETS that are NOT windowed: the whole "
+                            "clip rides in every chunk's cond. Comma-separated socket "
+                            "names as shown on this node (`ref_video_2`) or indexes "
+                            "(`2`).\n\n"
+                            "For a short LIKENESS clip (the subject IS the person in it, "
+                            "prompt-side role `likeness`) wired next to windowed control "
+                            "videos: without this the per-chunk window would slice a 5 s "
+                            "clip to nothing from chunk 2 on ('need at least 5 frames'). "
+                            "Never list a control video here -- it would ride whole "
+                            "through every chunk instead of its own span.\n\n"
+                            "Only matters with `window_ref_video` on; otherwise every "
+                            "reference is already whole. The clip is still trimmed to "
+                            "the 17j+5 grid and capped at the sequence length, and its "
+                            "tokens are attended at every step of every chunk."),
             ],
             outputs=[
                 MMH3CondSet.Output(display_name="cond_set"),
@@ -670,7 +717,8 @@ class MMH3ReferenceMultiPrompt(io.ComfyNode):
                 prompts=None, ref_images=None, ref_videos=None, ref_video_audios=None,
                 ref_audios=None, audio=None, use_input_audio=False,
                 window_ref_video=False, chunk_frames=0, overlap_frames=0,
-                embeddings="", unload_text_encoder=True) -> io.NodeOutput:
+                embeddings="", unload_text_encoder=True,
+                static_ref_videos="") -> io.NodeOutput:
         latent, frame_count = _empty_av_latent(width, height, length)
         if use_input_audio:
             if audio is None:
@@ -724,9 +772,13 @@ class MMH3ReferenceMultiPrompt(io.ComfyNode):
             logging.info("[MMH3ReferenceMultiPrompt] embeddings prepended -- %s",
                          "; ".join(spread[:4]) + (" ..." if len(spread) > 4 else ""))
 
-        raw_inputs = [ref_images]
-        for group in (ref_videos, ref_video_audios, ref_audios):
-            raw_inputs.extend((group or {}).values())
+        static = _parse_static_ref_videos(static_ref_videos, ref_videos)
+        if static and window_ref_video:
+            logging.info("[MMH3ReferenceMultiPrompt] static reference video(s), whole "
+                         "clip in every chunk, never windowed: %s",
+                         ", ".join("%s (%d frames)" % (n, int(ref_videos[n].shape[0]))
+                                   for n in sorted(static)
+                                   if ref_videos.get(n) is not None) or "none wired")
 
         # Per-chunk reference windows, or one reference set for every prompt.
         windows = None
@@ -762,14 +814,15 @@ class MMH3ReferenceMultiPrompt(io.ComfyNode):
                          ", ".join("%d-%d" % w for w in windows[:6])
                          + (" ..." if len(windows) > 6 else ""))
 
+        reference_cache = ReferenceCache()
         shared = None
         if windows is None:
-            shared = _build_refs(
-                vae, audio_vae, width, height, frame_count, ref_image_size,
-                ref_images, ref_videos, ref_video_audios, ref_audios)
+            shared = _cached_refs(
+                reference_cache, vae, audio_vae, width, height, frame_count, ref_image_size,
+                ref_images, ref_videos, ref_video_audios, ref_audios,
+                static_videos=static)
             ref_items, ref_blocks = shared
-            fp = _fingerprint(ref_blocks, raw_inputs, width, height, length,
-                              ref_image_size)
+            fp = reference_cache.fingerprint
 
         # With windowing on there is one cond PER WINDOW, not per prompt -- a single
         # prompt is reused for all of them. Iterating `texts` here is what made the
@@ -785,16 +838,16 @@ class MMH3ReferenceMultiPrompt(io.ComfyNode):
         built = []
         if windows is not None:
             for span in windows[:n_conds]:
-                items, blocks = _build_refs(
-                    vae, audio_vae, width, height, frame_count, ref_image_size,
+                items, blocks = _cached_refs(
+                    reference_cache, vae, audio_vae, width, height, frame_count, ref_image_size,
                     ref_images, ref_videos, ref_video_audios, ref_audios,
-                    ref_window=span)
-                built.append((items, blocks,
-                              _fingerprint(blocks, raw_inputs + [span], width, height,
-                                           length, ref_image_size)))
-            logging.info("[MMH3ReferenceMultiPrompt] %d window(s) encoded by the VAE "
+                    ref_window=span, static_videos=static)
+                built.append((items, blocks, reference_cache.fingerprint))
+            logging.info("[MMH3ReferenceMultiPrompt] %d reference window(s) prepared "
                          "in one pass; the text encoder loads once after this",
                          len(built))
+
+        reference_cache.finish()
 
         conds = []
         hits = 0
@@ -802,7 +855,7 @@ class MMH3ReferenceMultiPrompt(io.ComfyNode):
             text = texts[min(pi, len(texts) - 1)]
             if windows is not None:
                 ref_items, ref_blocks, fp = built[pi]
-            key = (text, fp)
+            key = (text, fp, str(clip.patcher.patches_uuid), model_key(vae), model_key(audio_vae))
             cached = _CACHE.get(key)
             if cached is not None:
                 conds.append(cached)
@@ -825,7 +878,7 @@ class MMH3ReferenceMultiPrompt(io.ComfyNode):
                      "(%d encodes reused)", len(conds), len(ref_blocks), frame_count, hits)
         return io.NodeOutput({"conds": conds, "prompts": texts, "fingerprint": fp},
                              latent, len(conds),
-                             _window_preview(ref_videos, windows))
+                             _window_preview(ref_videos, windows, skip=static))
 
 
 class MMH3CondSelect(io.ComfyNode):
