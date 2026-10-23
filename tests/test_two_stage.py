@@ -266,6 +266,7 @@ check("stage-2 audio = stage-1 estimate (never resized)",
 nz = st2[1]["noise"]
 check("fresh stage-2 video noise seeded from the stage-1 seed", isinstance(nz, TS.Stage2Noise)
       and nz.seed == 123 + 1 + TS.STAGE2_SEED_OFFSET, getattr(nz, "seed", None))
+check("stage-2 seed wraps below 2**64", TS.stage2_seed((1 << 64) - 1) == TS.STAGE2_SEED_OFFSET - 1)
 gen = nz.generate_noise(st2[1]["latent"]).unbind()
 first = st1[1]["noise"].generate_noise(st1[1]["latent"]).unbind()
 check("stage-2 audio noise == stage-1 audio noise", torch.equal(gen[1], first[1]))

@@ -44,6 +44,11 @@ UPSCALE_PRECISIONS = ["fp32", "fp16", "bf16"]
 STAGE2_SEED_OFFSET = 1_000_003
 
 
+def stage2_seed(stage1_seed):
+    """Stage-2 video seed for a chunk; wrapped so a randomized seed near 2**64 stays valid."""
+    return (int(stage1_seed) + STAGE2_SEED_OFFSET) % (1 << 64)
+
+
 def tail_context_rows(start, end, frames):
     """Smallest tail of whole H3 latent rows, ending at `end`, covering `frames` frames."""
     first = end

@@ -1481,8 +1481,7 @@ class MMH3LoopingSampler(io.ComfyNode):
                         nm2 = _sliced_mask(lat_v, lat_a, in_mask2_v, in_mask_a, v0, v1, a0, a1)
                     else:
                         nm2 = None
-                    noise2 = TS.Stage2Noise(nz, chunk,
-                                            int(getattr(nz, "seed", 0)) + TS.STAGE2_SEED_OFFSET)
+                    noise2 = TS.Stage2Noise(nz, chunk, TS.stage2_seed(getattr(nz, "seed", 0)))
                 else:
                     nm2 = chunk.get("noise_mask")
                     noise2 = nz      # same grid: the phase-2 handoff, same noise
