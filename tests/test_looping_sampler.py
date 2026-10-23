@@ -109,7 +109,7 @@ def run(total=TOTAL, chunk=CHUNK, ov=OV, prompts=None, carry="mask",
         FakeNoise(), g, "S", sigmas, {"conds": cs},
         latent if latent is not None else clip(total),
         chunk, ov, carry, 1.0, 1.0,
-        start, end, p2_start, p2_sampler, p2_guider, kf, kf_idx, vae).result
+        start, end, p2_start, p2_sampler, p2_guider, kf, kf_idx, vae).result[:3]
     return out, g
 
 

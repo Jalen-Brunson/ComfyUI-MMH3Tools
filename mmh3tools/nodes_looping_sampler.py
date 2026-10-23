@@ -62,10 +62,11 @@ from comfy.nested_tensor import NestedTensor
 
 from comfy_extras.nodes_custom_sampler import SamplerCustomAdvanced, SplitSigmas
 
+from . import two_stage as TS
 from .common import (AUDIO_LATENT_FPS, AUDIO_T_DIM, FPS, LATENTS_PER_GROUP,
                      LATENT_BASE, VAE_SPATIAL, VIDEO_T_DIM,
-                     frame_at_latent, frames_to_audio_t, latents_to_frames,
-                     pack_av, unpack_av)
+                     frame_at_latent, frames_to_audio_t, frames_to_latents,
+                     latents_to_frames, pack_av, unpack_av)
 from .nodes_loop import per_row_mask_is_continuous
 from .nodes_multiprompt import MMH3CondSet
 from .nodes_preview import begin_preview
@@ -682,11 +683,91 @@ class MMH3LoopingSampler(io.ComfyNode):
                             "is unknown. Each ramped row gets its own timestep "
                             "(rows_t = 1 - m*sigma); on the current core those survive at "
                             "full latent-frame resolution, unpooled and unbinarised."),
+                # FORK 2026-10-23: context frames and a second stage per chunk (see
+                # two_stage.py). Appended after every existing input so saved graphs keep
+                # their widget values; every default reproduces the sampler as it was.
+                io.Combo.Input(
+                    "overlap_pin", options=TS.OVERLAP_PINS, default="full", optional=True,
+                    tooltip="`mask` carry only. full = every carried row is pinned (as "
+                            "before). tail_custom = only the last `context_frames` of the "
+                            "carry stay pinned; the earlier carried rows are redrawn as this "
+                            "chunk's own lead-in and then discarded -- the write-back starts at "
+                            "the previous chunk's end, so frames already rendered never change. "
+                            "The audio carry is unchanged."),
+                io.Int.Input(
+                    "context_frames", default=5, min=0, max=3600, optional=True,
+                    tooltip="tail_custom: frames of the carry kept pinned, rounded UP to whole "
+                            "latent rows (each 17 frames are rows of 1-4-4-4-4); with a 39-frame "
+                            "overlap 5, 9, 13, 17, 22 and 39 are exact. 0 releases every carried "
+                            "video row. At or above the overlap it equals full."),
+                io.Int.Input(
+                    "accepted_prefix_frames", default=0, min=0, max=100000, optional=True,
+                    tooltip="Frames at the start of the master that are already final (a "
+                            "resume's accepted prefix). Chunks inside it are skipped, its rows "
+                            "are never written back, and tail_custom releases carried rows "
+                            "inside it fully rather than to the master's resume pin."),
+                io.Guider.Input(
+                    "stage2_guider", optional=True,
+                    tooltip="Stage 2's guider: its MODEL, CFG and negative. Its positive is "
+                            "replaced by each chunk's prompt, like the main guider's. Unwired = "
+                            "the main guider. Patches stage 2 needs (LoRA, PDD, SigmaShift, "
+                            "control schedules, attention) must be on THIS model."),
+                io.Sampler.Input(
+                    "stage2_sampler", optional=True,
+                    tooltip="Stage 2's sampler. Unwired = the main sampler."),
+                io.Sigmas.Input(
+                    "stage2_sigmas", optional=True,
+                    tooltip="Wiring this turns stage 2 on: every chunk finishes with a second "
+                            "pass over these sigmas (strictly descending, <= 1, ending at 0). "
+                            "Stage 1's DENOISED estimate is re-noised at the first sigma, so any "
+                            "schedule works -- e.g. stage 1 = the PDD sigmas split at step 7, "
+                            "stage 2 = ManualSigmas 0.6316, 0.3158, 0. The main `sigmas` then "
+                            "normally stop above 0."),
+                io.Combo.Input(
+                    "upscale_model", options=TS.upscale_choices(), default=TS.UPSCALE_NONE,
+                    optional=True,
+                    tooltip="Learned H3 latent upscaler (models/latent_upscale_models) run on "
+                            "each chunk between the stages; needs stage 2. Upscaled chunks get "
+                            "fresh video noise on the new grid; audio is never resized. none = "
+                            "stage 2 on the same grid."),
+                io.Float.Input(
+                    "upscale_megapixels", default=1.0, min=0.05, max=16.0, step=0.05,
+                    optional=True,
+                    tooltip="Size of the stage-2 grid: 1024^2 pixels per MP, sides snapped to "
+                            "32 px, aspect kept. Must be larger than the master's grid."),
+                io.Combo.Input(
+                    "upscale_precision", options=TS.UPSCALE_PRECISIONS, default="fp32",
+                    optional=True,
+                    tooltip="Upscaler compute dtype. fp32 measured fastest and best on the "
+                            "H200; avoid bf16."),
+                io.Boolean.Input(
+                    "upscale_temporal_chunking", default=False, optional=True,
+                    tooltip="Upscale in 32-latent temporal chunks with cross-fades (less VRAM)."),
+                io.Boolean.Input(
+                    "keep_upscaler_loaded", default=True, optional=True,
+                    tooltip="Keep the upscaler on the GPU between chunks."),
+                io.Combo.Input(
+                    "stage1_carry", options=TS.STAGE1_CARRY, default="estimate", optional=True,
+                    tooltip="With an upscaler: what stage 1 pins on its own grid. estimate = the "
+                            "previous chunk's stage-1 estimate (no round trip). downscaled_final "
+                            "= its finished stage-2 rows, area-downscaled."),
+                io.Latent.Input(
+                    "stage2_latent", optional=True,
+                    tooltip="With an upscaler: the master on the stage-2 grid. Required when a "
+                            "chunk carries rows this run does not render (resume, accepted "
+                            "frames): the previous finished chunks come from here. Rows the "
+                            "master pins (v2v keep regions) take its exact high-res source; "
+                            "unwired, they are upscaled from stage 1. Its audio is not used."),
             ],
             outputs=[
                 io.Latent.Output(display_name="latent"),
                 io.Int.Output(display_name="chunks_rendered"),
                 io.String.Output(display_name="report"),
+                io.Latent.Output(
+                    display_name="stage1_latent",
+                    tooltip="The master on the stage-1 grid: each chunk's stage-1 estimate. "
+                            "Equal to `latent` without an upscaler. Save it to resume a "
+                            "two-grid run with stage1_carry = estimate."),
             ],
         )
 
@@ -702,7 +783,12 @@ class MMH3LoopingSampler(io.ComfyNode):
                 carry_noise_level=0.0, carry_noise_until_sigma=0.96, reference_latent=None,
                 reroll_retries=0,
                 reroll_thresholds="luma=0.14,hf=3.0,cmean=0.25",
-                feather_latents=0) -> io.NodeOutput:
+                feather_latents=0, overlap_pin="full", context_frames=5,
+                accepted_prefix_frames=0, stage2_guider=None, stage2_sampler=None,
+                stage2_sigmas=None, upscale_model=TS.UPSCALE_NONE, upscale_megapixels=1.0,
+                upscale_precision="fp32", upscale_temporal_chunking=False,
+                keep_upscaler_loaded=True, stage1_carry="estimate",
+                stage2_latent=None) -> io.NodeOutput:
         conds = (cond_set or {}).get("conds") or []
         if not conds:
             raise ValueError("MMH3LoopingSampler: cond_set holds no conditioning.")
@@ -865,8 +951,65 @@ class MMH3LoopingSampler(io.ComfyNode):
                          % (int(phase2_start_step),
                             "" if phase2_guider is None else ", with its own guider"))
 
+        # ---- FORK 2026-10-23: context frames and stage 2 (two_stage.py) ------
+        tail_mode = overlap_pin == "tail_custom"
+        stage2_on = stage2_sigmas is not None
+        upscale_on = (upscale_model or TS.UPSCALE_NONE) != TS.UPSCALE_NONE
+        two_grid = stage2_on and upscale_on
+        if upscale_on and not stage2_on:
+            raise ValueError(
+                "MMH3LoopingSampler: upscale_model runs between the stages, so it needs stage "
+                "2 -- wire stage2_sigmas (and normally stage2_guider), or set upscale_model "
+                "to none.")
+        if stage2_on:
+            TS.validate_sigmas(stage2_sigmas, "stage2_sigmas")
+        if (tail_mode or stage2_on) and carry == "keyframe":
+            raise ValueError(
+                "MMH3LoopingSampler: overlap_pin tail_custom and stage 2 work on the masked "
+                "carry; set carry to mask.")
+        if (tail_mode or stage2_on) and (float(pin_renorm_video or 0) > 0
+                                         or float(carry_precomp or 0) > 0
+                                         or float(carry_noise_level or 0) > 0):
+            raise ValueError(
+                "MMH3LoopingSampler: pin_renorm, carry_precomp and carry_noise assume the "
+                "whole carried head is pinned on one grid; set them to 0 to use "
+                "overlap_pin tail_custom or stage 2.")
+        if stage2_on and prior_av_latent is not None:
+            raise ValueError("MMH3LoopingSampler: prior_av_latent does not support stage 2.")
+        accepted_t = (frames_to_latents(int(accepted_prefix_frames))
+                      if int(accepted_prefix_frames or 0) > 0 else 0)
+        hi_size = None
+        if two_grid:
+            hi_size = TS.target_size(master_v, float(upscale_megapixels))
+            lo_size = tuple(int(x) for x in master_v.shape[3:])
+            if hi_size[0] < lo_size[0] or hi_size[1] < lo_size[1] or tuple(hi_size) == lo_size:
+                raise ValueError(
+                    "MMH3LoopingSampler: upscale_megapixels %.2f gives a %dx%d grid, not larger "
+                    "than the master's %dx%d. Raise it, or set upscale_model to none."
+                    % (float(upscale_megapixels), hi_size[1] * VAE_SPATIAL,
+                       hi_size[0] * VAE_SPATIAL, lo_size[1] * VAE_SPATIAL,
+                       lo_size[0] * VAE_SPATIAL))
+        if tail_mode:
+            lines.append("context frames: tail_custom, %d frame(s) of each carry pinned "
+                         "(rounded up to whole latent rows); earlier carried rows redrawn "
+                         "and discarded" % int(context_frames))
+        if accepted_t:
+            lines.append("accepted prefix: %d frames (%d latents) kept as given"
+                         % (int(accepted_prefix_frames), accepted_t))
+        if stage2_on:
+            lines.append("stage 2: %s, %s guider, %s sampler"
+                         % (TS.describe_sigmas(stage2_sigmas),
+                            "own" if stage2_guider is not None else "main",
+                            "own" if stage2_sampler is not None else "main"))
+        if two_grid:
+            lines.append("stage 2 grid: %dx%d -> %dx%d via %s (%.2f MP, %s); stage-1 carry = %s"
+                         % (master_v.shape[4] * VAE_SPATIAL, master_v.shape[3] * VAE_SPATIAL,
+                            hi_size[1] * VAE_SPATIAL, hi_size[0] * VAE_SPATIAL, upscale_model,
+                            float(upscale_megapixels), upscale_precision, stage1_carry))
+
         # ---- keyframes, encoded ONCE, placed on the real timeline -----------
         guides_by_chunk = {}
+        guides_hi = {}
         if keyframes is None:
             # Indices with no images attached are INERT, not fatal. A ladder reuses
             # one graph across passes and usually only the first pass carries
@@ -923,6 +1066,13 @@ class MMH3LoopingSampler(io.ComfyNode):
                 z = vae.encode(px)
                 guides_by_chunk.setdefault(ci, []).append(
                     {"resolved_frame_index": int(local), "latent": z})
+                if two_grid:
+                    # stage 2 samples on the upscaled grid, and guide rows share it
+                    px_hi, _n = _fit_keyframe(keyframes[img_i:img_i + 1],
+                                              hi_size[1] * VAE_SPATIAL,
+                                              hi_size[0] * VAE_SPATIAL, is_opener=(g == 0))
+                    guides_hi.setdefault(ci, []).append(
+                        {"resolved_frame_index": int(local), "latent": vae.encode(px_hi)})
                 lines.append("  keyframe frame %d -> chunk %d local frame %d%s"
                              % (g, ci, local, "" if not note else ", resized " + note))
 
@@ -982,6 +1132,32 @@ class MMH3LoopingSampler(io.ComfyNode):
                 in_mask_a = ma if in_mask_a is None else torch.minimum(
                     in_mask_a.to(ma.dtype), ma)
 
+        # FORK 2026-10-23: the FINAL-grid master. One grid: the master itself, so every
+        # existing path reads and writes exactly what it did. Two grids: stage 2's own
+        # master -- stage2_latent's rows if wired, otherwise empty until chunks land --
+        # and `out_v` becomes the stage-1 grid's master of estimates.
+        fin_v, in_mask2_v, hi_valid = out_v, in_mask_v, None
+        if two_grid:
+            if stage2_latent is not None:
+                s2_v = unpack_av(stage2_latent, "stage2_latent", allow_video_only=True)[0]
+                if (int(s2_v.shape[1]) != int(master_v.shape[1])
+                        or int(s2_v.shape[VIDEO_T_DIM]) != total_t
+                        or tuple(int(x) for x in s2_v.shape[3:]) != tuple(hi_size)):
+                    raise ValueError(
+                        "MMH3LoopingSampler: stage2_latent is %s but stage 2 needs %d latents "
+                        "at %dx%d (the master's length on the upscale_megapixels grid)."
+                        % (tuple(s2_v.shape), total_t, hi_size[1] * VAE_SPATIAL,
+                           hi_size[0] * VAE_SPATIAL))
+                fin_v = s2_v.to(device=master_v.device, dtype=master_v.dtype).clone()
+                hi_valid = torch.ones(total_t, dtype=torch.bool)
+                lines.append("  stage2_latent: previous chunks and pinned source rows on "
+                             "the stage-2 grid come from it")
+            else:
+                fin_v = torch.zeros(list(master_v.shape[:3]) + list(hi_size),
+                                    dtype=master_v.dtype, device=master_v.device)
+                hi_valid = torch.zeros(total_t, dtype=torch.bool)
+            in_mask2_v = TS.resize_mask(in_mask_v, hi_size)
+
         # None unless something wired MMH3 Timeline Preview onto the model. The
         # sampler must behave identically when it is None, which is why the preview
         # is DISCOVERED here rather than owned: no wiring, no object, no branch that
@@ -1032,6 +1208,13 @@ class MMH3LoopingSampler(io.ComfyNode):
             lines.append("  carry_precomp %.2f (cap %.3f per channel per hop): carried head's "
                          "channel means held at chunk 0's offset from reference_latent, "
                          "context-only (bytes restored)" % (_pc, _pc_cap))
+        if two_grid and _ref_v is not None and \
+                tuple(int(x) for x in _ref_v.shape[3:]) != tuple(hi_size):
+            raise ValueError(
+                "MMH3LoopingSampler: reference_latent is %dx%d but the re-roll guard scores "
+                "chunks on the stage-2 grid (%dx%d); encode the reference at that size."
+                % (_ref_v.shape[4] * VAE_SPATIAL, _ref_v.shape[3] * VAE_SPATIAL,
+                   hi_size[1] * VAE_SPATIAL, hi_size[0] * VAE_SPATIAL))
         _cn_level = max(0.0, min(1.0, float(carry_noise_level or 0.0)))
         _cn_sigma = float(carry_noise_until_sigma or 0.0)
         if _cn_level > 0.0:
@@ -1065,6 +1248,15 @@ class MMH3LoopingSampler(io.ComfyNode):
                                            overlap))
                 logging.info("[MMH3LoopingSampler] %s", lines[-1].strip())
 
+            if accepted_t and v1 <= accepted_t:
+                lines.append("  chunk %d: inside the accepted prefix -- SKIPPED" % i)
+                logging.info("[MMH3LoopingSampler] chunk %d/%d accepted -- skipped", i + 1, n)
+                continue
+            carried_a = (_audio_index_at(v0 + carried, total_t, total_a) - a0) if carried else 0
+            # tail_custom: carried rows [0, free) are released; [free, carried) stay pinned
+            free = (carried - TS.tail_context_rows(v0, v0 + carried, int(context_frames))
+                    if (tail_mode and carried) else 0)
+
             sub_v = out_v[:, :, v0:v1].clone()
             sub_a = None if out_a is None else out_a[:, :, :, a0:a1].clone()
             chunk = pack_av(latent, sub_v, sub_a, noise_mask=None)
@@ -1087,6 +1279,10 @@ class MMH3LoopingSampler(io.ComfyNode):
                     _audio_index_at(v0 + carried, total_t, total_a) - a0,
                     float(overlap_strength_video), float(overlap_strength_audio),
                     in_mask_v, in_mask_a, v0, v1, a0, a1, int(feather_latents))
+                if free:
+                    chunk["noise_mask"] = TS.release_head(
+                        chunk["noise_mask"], free,
+                        TS.head_floor(in_mask_v, sub_v, v0, free, accepted_t))
             elif in_mask_v is not None or in_mask_a is not None:
                 chunk["noise_mask"] = _sliced_mask(sub_v, sub_a, in_mask_v, in_mask_a,
                                                    v0, v1, a0, a1)
@@ -1107,6 +1303,23 @@ class MMH3LoopingSampler(io.ComfyNode):
                     logging.info("[MMH3LoopingSampler] chunk %d/%d fully pinned -- "
                                  "skipped", i + 1, n)
                     continue
+
+            if two_grid and carried:
+                # Stage 2 pins the previous chunk's FINISHED rows on its own grid. Rows this
+                # run never rendered (a resume's pinned window, accepted frames) can only
+                # come from stage2_latent; upscaling a stage-1 estimate in their place would
+                # silently swap finished frames for a guess.
+                gap = (~hi_valid[v0 + free:v0 + carried]).nonzero()
+                if gap.numel():
+                    raise ValueError(
+                        "MMH3LoopingSampler: chunk %d carries latents %d-%d, which this run "
+                        "did not render, and nothing holds them on the stage-2 grid. Wire the "
+                        "previous run's final master (stage-2 grid) to stage2_latent."
+                        % (i, v0 + free + int(gap[0]), v0 + carried - 1))
+                if stage1_carry == "downscaled_final":
+                    # chunk["samples"] wraps sub_v, so this reaches stage 1
+                    sub_v[:, :, :carried] = TS.downscale_video(
+                        fin_v[:, :, v0:v0 + carried], tuple(sub_v.shape[3:])).to(sub_v.dtype)
 
             # LOCAL PATCH 2026-08-31 (pin_renorm): after the skip check so skipped
             # windows stay untouched; chunk["samples"] aliases sub_v (pack_av wraps
@@ -1152,7 +1365,7 @@ class MMH3LoopingSampler(io.ComfyNode):
                     w0 = windows[0].index_list
                     r0 = w0[0] + offset
                     r1 = min(w0[-1] + 1 + offset, total_t)
-                    _pc_ref0 = (out_v[:, :, r0:r1].float().mean(dim=(0, 2, 3, 4))
+                    _pc_ref0 = (fin_v[:, :, r0:r1].float().mean(dim=(0, 2, 3, 4))
                                 - _ref_v[:, :, r0:r1].float().mean(dim=(0, 2, 3, 4)).to(out_v.device))
                     lines.append("  reference offset from window 0 (latents %d-%d), |offset| mean %.3f"
                                  % (r0, r1, float(_pc_ref0.abs().mean())))
@@ -1179,6 +1392,7 @@ class MMH3LoopingSampler(io.ComfyNode):
                 if _cn_level > 0.0:
                     _cn = (_cn_level, _cn_sigma, carried)
 
+            base_cond = chunk_cond
             if chunk_guides:
                 if _has_refs(chunk_cond) and not _guide_origin_correct():
                     raise RuntimeError(
@@ -1187,6 +1401,12 @@ class MMH3LoopingSampler(io.ComfyNode):
                         "of the target origin. See docs/core-changes.md." % i)
                 chunk_cond = node_helpers.conditioning_set_values(
                     chunk_cond, {"minimax_keyframes": chunk_guides})
+            # stage 2 on another grid takes the same keyframes encoded for that grid
+            cond2 = chunk_cond
+            if two_grid:
+                cond2 = (node_helpers.conditioning_set_values(
+                    base_cond, {"minimax_keyframes": guides_hi[i]}) if guides_hi.get(i)
+                    else base_cond)
 
             # frame_at_latent, NOT latents_to_frames: v0 is an arbitrary window
             # bound, and latents_to_frames is only meaningful on the 5j+2 grid --
@@ -1197,6 +1417,18 @@ class MMH3LoopingSampler(io.ComfyNode):
             # of every chunk whatever prompt happens to be wired to it.
             g2 = None if phase2_guider is None else _chunk_guider(
                 phase2_guider, chunk_cond, frame0=frame_at_latent(v0))
+            # Stage 2 likewise: its guidance settings and model, THIS chunk's prompt.
+            gs2 = None if not stage2_on else _chunk_guider(
+                stage2_guider if stage2_guider is not None else guider, cond2,
+                frame0=frame_at_latent(v0))
+            if tail_mode and carried:
+                # Released rows are not all-zero mask rows, so H3ChunkPreviewTap cannot
+                # infer the pinned context from the mask; publish the span instead.
+                # (_chunk_guider rebinds both option levels, so this stays per chunk.)
+                for _gg in (g, g2, gs2):
+                    if _gg is not None:
+                        _gg.model_options["transformer_options"]["h3_tap_context_rows"] = (
+                            int(free), int(carried))
             if preview is not None:
                 # Before, not after: the per-step callback fires during the sample
                 # and needs to know which chunk it is watching.
@@ -1210,17 +1442,75 @@ class MMH3LoopingSampler(io.ComfyNode):
             if _rr_retries > 0 and carried and carry != "keyframe":
                 _rr_ref = _reroll_prev if _reroll_prev is not None else _fresh_stats(
                     _pr_orig_head if _pr_orig_head is not None
-                    else out_v[:, :, v0:v0 + carried])
+                    else fin_v[:, :, v0:v0 + carried])
 
-            def _run_once(nz, attempt, _g=g, _g2=g2):
-                ga, g2a = _g, _g2
+            def _finish(nz, gs, s1):
+                """Stage 2 of this chunk, from stage 1's denoised estimate `s1`."""
+                x_v, x_a = unpack_av(s1, "chunk %d stage 1" % i)
+                if two_grid:
+                    lat_v = TS.upscale_video(
+                        x_v, upscale_model, float(upscale_megapixels), upscale_precision,
+                        upscale_temporal_chunking, keep_upscaler_loaded).to(x_v.dtype)
+                    if stage2_latent is not None and in_mask2_v is not None:
+                        # rows the master pins take stage2_latent's exact source
+                        m = in_mask2_v[:, :, v0:v1].to(device=lat_v.device, dtype=torch.float32)
+                        src = fin_v[:, :, v0:v1].to(device=lat_v.device, dtype=torch.float32)
+                        lat_v = (src + (lat_v.float() - src) * m).to(x_v.dtype)
+                else:
+                    lat_v = x_v.clone()
+                if carried:
+                    # the pinned carry is the previous chunk's FINISHED rows
+                    lat_v[:, :, free:carried] = fin_v[:, :, v0 + free:v0 + carried].to(
+                        device=lat_v.device, dtype=lat_v.dtype)
+                lat_a = None if x_a is None else x_a.clone()
+                if lat_a is not None and carried_a > 0:
+                    # anchor the audio carry on the original rows, not stage 1's
+                    # partially re-estimated copy (strength < 1 would compound)
+                    lat_a[:, :, :, :carried_a] = out_a[:, :, :, a0:a0 + carried_a].to(
+                        device=lat_a.device, dtype=lat_a.dtype)
+                if two_grid:
+                    if carried:
+                        nm2 = _carry_mask(lat_v, lat_a, carried, carried_a,
+                                          float(overlap_strength_video),
+                                          float(overlap_strength_audio), in_mask2_v, in_mask_a,
+                                          v0, v1, a0, a1, int(feather_latents))
+                        if free:
+                            nm2 = TS.release_head(nm2, free, TS.head_floor(
+                                in_mask2_v, lat_v, v0, free, accepted_t))
+                    elif in_mask2_v is not None or in_mask_a is not None:
+                        nm2 = _sliced_mask(lat_v, lat_a, in_mask2_v, in_mask_a, v0, v1, a0, a1)
+                    else:
+                        nm2 = None
+                    noise2 = TS.Stage2Noise(nz, chunk,
+                                            int(getattr(nz, "seed", 0)) + TS.STAGE2_SEED_OFFSET)
+                else:
+                    nm2 = chunk.get("noise_mask")
+                    noise2 = nz      # same grid: the phase-2 handoff, same noise
+                lat = pack_av(chunk, lat_v, lat_a)
+                lat.pop("noise_mask", None)
+                if nm2 is not None:
+                    lat["noise_mask"] = nm2
+                _, out2 = SamplerCustomAdvanced().sample(
+                    noise2, gs, stage2_sampler if stage2_sampler is not None else sampler,
+                    stage2_sigmas, lat)
+                return out2
+
+            stage1_by_attempt = {}
+
+            def _run_once(nz, attempt, _g=g, _g2=g2, _gs=gs2):
+                ga, g2a, gsa = _g, _g2, _gs
                 if _rr_retries > 0:
                     ga = _mark_attempt(_g, attempt)
                     g2a = None if _g2 is None else _mark_attempt(_g2, attempt)
-                return _run_sampling(nz, ga, sampler, sigmas, chunk,
-                                     sampling_start_step, sampling_end_step,
-                                     phase2_sampler, g2a, phase2_start_step,
-                                     carry_noise=_cn)
+                    gsa = None if _gs is None else _mark_attempt(_gs, attempt)
+                s1 = _run_sampling(nz, ga, sampler, sigmas, chunk,
+                                   sampling_start_step, sampling_end_step,
+                                   phase2_sampler, g2a, phase2_start_step,
+                                   carry_noise=_cn)
+                if not stage2_on:
+                    return s1
+                stage1_by_attempt[attempt] = s1
+                return _finish(nz, gsa, s1)
 
             _rr_drift = None
             if (_rr_ref is not None and _ref_v is not None and _pc_ref0 is not None
@@ -1230,18 +1520,34 @@ class MMH3LoopingSampler(io.ComfyNode):
                 _run_once, noise, i, _rr_retries if _rr_ref is not None else 0,
                 _rr_ref, _rr_th, carried, lines, drift=_rr_drift)
             if _rr_retries > 0:
-                _emit = getattr(g, "h3_tap_emit", None)
+                # with stage 2 the finished chunk comes out of the stage-2 guider: emit
+                # through its tap, or the main guider's if only that one is tapped
+                _tg = g
+                if gs2 is not None and callable(getattr(gs2, "h3_tap_emit", None)):
+                    _tg = gs2
+                _emit = getattr(_tg, "h3_tap_emit", None)
                 if callable(_emit):
                     try:
-                        _emit(done["samples"], sigmas)
+                        _emit(done["samples"], stage2_sigmas if stage2_on else sigmas)
                     except Exception as e:  # a preview must never kill the run
                         logging.warning("[MMH3LoopingSampler] chunk %d: tap emit failed (%s: %s)",
                                         i, type(e).__name__, e)
 
             dv, da = unpack_av(done, "chunk %d output" % i)
-            out_v[:, :, v0:v1] = dv.to(out_v.dtype)
+            # tail_custom: the redrawn carry was context only -- the previous chunk keeps
+            # its rows. Accepted rows are never rewritten. Otherwise the whole window, as
+            # before (pinned head rows come back byte-identical at strength 1).
+            w0 = v0 + carried if tail_mode else v0
+            if accepted_t:
+                w0 = max(w0, min(accepted_t, v1))
+            fin_v[:, :, w0:v1] = dv[:, :, w0 - v0:].to(fin_v.dtype)
+            if two_grid:
+                s1v = unpack_av(stage1_by_attempt[_rr_kept], "chunk %d stage 1" % i)[0]
+                out_v[:, :, w0:v1] = s1v[:, :, w0 - v0:].to(out_v.dtype)
+                hi_valid[w0:v1] = True
             if out_a is not None and da is not None:
-                out_a[:, :, :, a0:a1] = da.to(out_a.dtype)
+                aw0 = max(a0, _audio_index_at(accepted_t, total_t, total_a)) if accepted_t else a0
+                out_a[:, :, :, aw0:a1] = da[:, :, :, aw0 - a0:].to(out_a.dtype)
             # LOCAL PATCH 2026-08-31 (pin_renorm): the renormalized head has done its
             # job as context; restore the original bytes so already-rendered overlap
             # frames are never altered (mirrors the prior_t restore below).
@@ -1249,7 +1555,7 @@ class MMH3LoopingSampler(io.ComfyNode):
                 out_v[:, :, v0:v0 + carried] = _pr_orig_head
             if _rr_retries > 0:
                 _reroll_prev = (_rr_stats if _rr_stats is not None
-                                else _fresh_stats(out_v[:, :, v0 + carried:v1]))
+                                else _fresh_stats(fin_v[:, :, v0 + carried:v1]))
 
             lines.append("  chunk %d: prompt %d, frames %d-%d, %d carried%s"
                          % (i, min(i, len(conds) - 1), spans[i][0], spans[i][1],
@@ -1257,6 +1563,13 @@ class MMH3LoopingSampler(io.ComfyNode):
                             ", %d keyframe(s)" % (len(chunk_guides) - (1 if carried
                                                   and carry == "keyframe" else 0))
                             if guides_by_chunk.get(i) else ""))
+            if (tail_mode and carried) or stage2_on:
+                lines[-1] += "".join([
+                    (", context %d of %d carried latents pinned (%d frames), %d redrawn"
+                     % (carried - free, carried,
+                        frame_at_latent(v0 + carried) - frame_at_latent(v0 + free), free))
+                    if tail_mode and carried else "",
+                    ", stage 2 done" if stage2_on else ""])
             if preview is not None:
                 preview.chunk(i, dv, v0, v1)
             logging.info("[MMH3LoopingSampler] chunk %d/%d done", i + 1, n)
@@ -1272,12 +1585,17 @@ class MMH3LoopingSampler(io.ComfyNode):
             if out_a is not None and keep_a is not None:
                 out_a[:, :, :, :prior_at] = keep_a
 
-        out = pack_av(latent, out_v, out_a, noise_mask=None)
+        out = pack_av(latent, fin_v, out_a, noise_mask=None)
+        stage1_out = out
+        if two_grid:
+            # the input's noise_mask is on the stage-1 grid; it stays with stage1_latent
+            out.pop("noise_mask", None)
+            stage1_out = pack_av(latent, out_v, out_a, noise_mask=None)
         lines.append("master: %d latents (%d frames, %.2fs) -- the input length, exactly"
                      % (total_t, total_f, total_f / float(FPS)))
         report = "\n".join(lines)
         logging.info("[MMH3LoopingSampler] " + lines[0])
-        return io.NodeOutput(out, n, report)
+        return io.NodeOutput(out, n, report, stage1_out)
 
 
 def _split_mask(latent):

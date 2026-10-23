@@ -58,7 +58,7 @@ def run(prior_frames, new_frames, chunk=481, ov=22):
         Noise(), G(), "S", torch.linspace(1, 0, 13),
         {"conds": [cond("p%d" % i) for i in range(20)]},
         new, chunk, ov, "mask", 1.0, 1.0, 0, 1000, 0, None, None, None, "", None,
-        prior).result
+        prior).result[:3]
     return out, pt, nt
 
 
@@ -150,7 +150,7 @@ for pf in (72, 120, 240, 480, 1128):
         o, n, rep = LS.MMH3LoopingSampler.execute(
             Noise(), G(), "S", torch.linspace(1, 0, 13), {"conds": [cond("p")]},
             new, 0, 22, "mask", 1.0, 0.9, 0, 1000, 0, None, None, None, "", None,
-            prior).result
+            prior).result[:3]
         v, _ = o["samples"].unbind()
         ot = int(v.shape[VIDEO_T_DIM])
         good = (n == 1 and ot % 5 == 2
